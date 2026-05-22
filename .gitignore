@@ -1,0 +1,23 @@
+# Rust build artifacts
+/target
+
+# Environment files (contain API keys and secrets)
+.env
+.env.local
+.env.production
+
+# Production config (may contain secrets)
+config_production.yaml
+
+# Log files
+*.log
+whatsapp-bridge.log
+
+# macOS
+.DS_Store
+
+# Editor
+.idea/
+.vscode/
+*.swp
+*.swo

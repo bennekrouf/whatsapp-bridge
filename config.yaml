@@ -1,0 +1,10 @@
+server:
+  host: "0.0.0.0"
+  port: 8095
+
+store:
+  address: "http://127.0.0.1:5007"
+
+claude:
+  model: "claude-sonnet-4-20250514"
+  max_tokens: 1024

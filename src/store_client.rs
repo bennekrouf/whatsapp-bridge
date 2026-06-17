@@ -1,5 +1,5 @@
+use crate::error::{BridgeError, BridgeResult};
 use crate::models::{ChannelInfo, ClaudeMessage, DownstreamAuth, McpTool};
-use anyhow::{anyhow, Result};
 use graflog::app_log;
 
 pub struct StoreClient {
@@ -18,7 +18,7 @@ impl StoreClient {
     }
 
     // Look up channel config by phone_number_id
-    pub async fn get_channel(&self, phone_number_id: &str) -> Result<Option<ChannelInfo>> {
+    pub async fn get_channel(&self, phone_number_id: &str) -> BridgeResult<Option<ChannelInfo>> {
         let url = format!(
             "{}/api/internal/whatsapp/channel/{}",
             self.base_url,
@@ -29,19 +29,23 @@ impl StoreClient {
             .get(&url)
             .header("X-Internal-Secret", &self.secret)
             .send()
-            .await?;
+            .await
+            .map_err(BridgeError::StoreNetwork)?;
 
         if resp.status() == 404 {
             return Ok(None);
         }
         if !resp.status().is_success() {
-            return Err(anyhow!("Store returned {}", resp.status()));
+            return Err(BridgeError::Store {
+                status: resp.status().as_u16(),
+                message: resp.text().await.unwrap_or_default(),
+            });
         }
         Ok(Some(resp.json().await?))
     }
 
     // Look up channel config by tenant_id
-    pub async fn get_channel_by_tenant(&self, tenant_id: &str) -> Result<Option<serde_json::Value>> {
+    pub async fn get_channel_by_tenant(&self, tenant_id: &str) -> BridgeResult<Option<serde_json::Value>> {
         let url = format!(
             "{}/api/internal/whatsapp/channel/by-tenant/{}",
             self.base_url,
@@ -52,13 +56,17 @@ impl StoreClient {
             .get(&url)
             .header("X-Internal-Secret", &self.secret)
             .send()
-            .await?;
+            .await
+            .map_err(BridgeError::StoreNetwork)?;
 
         if resp.status() == 404 {
             return Ok(None);
         }
         if !resp.status().is_success() {
-            return Err(anyhow!("Store returned {}", resp.status()));
+            return Err(BridgeError::Store {
+                status: resp.status().as_u16(),
+                message: resp.text().await.unwrap_or_default(),
+            });
         }
         Ok(Some(resp.json().await?))
     }
@@ -68,7 +76,7 @@ impl StoreClient {
         &self,
         tenant_id: &str,
         customer_phone: &str,
-    ) -> Result<Vec<ClaudeMessage>> {
+    ) -> BridgeResult<Vec<ClaudeMessage>> {
         let url = format!(
             "{}/api/internal/whatsapp/session/{}/{}",
             self.base_url,
@@ -80,7 +88,8 @@ impl StoreClient {
             .get(&url)
             .header("X-Internal-Secret", &self.secret)
             .send()
-            .await?;
+            .await
+            .map_err(BridgeError::StoreNetwork)?;
 
         if !resp.status().is_success() {
             app_log!(warn, "Failed to load session, starting fresh");
@@ -101,7 +110,7 @@ impl StoreClient {
         tenant_id: &str,
         customer_phone: &str,
         history: &[ClaudeMessage],
-    ) -> Result<()> {
+    ) -> BridgeResult<()> {
         let url = format!(
             "{}/api/internal/whatsapp/session/{}/{}",
             self.base_url,
@@ -113,14 +122,15 @@ impl StoreClient {
             .header("X-Internal-Secret", &self.secret)
             .json(&serde_json::json!({ "history": history }))
             .send()
-            .await?;
+            .await
+            .map_err(BridgeError::StoreNetwork)?;
         Ok(())
     }
 
     // Get tenant MCP tools
-    pub async fn get_tools(&self, tenant_id: &str) -> Result<Vec<McpTool>> {
+    pub async fn get_tools(&self, tenant_id: &str) -> BridgeResult<Vec<McpTool>> {
         let url = format!("{}/api/mcp-tools/{}", self.base_url, urlencoding::encode(tenant_id));
-        let resp = self.client.get(&url).send().await?;
+        let resp = self.client.get(&url).send().await.map_err(BridgeError::StoreNetwork)?;
         if !resp.status().is_success() {
             return Ok(vec![]);
         }
@@ -130,6 +140,30 @@ impl StoreClient {
             .and_then(|t| serde_json::from_value(t.clone()).ok())
             .unwrap_or_default();
         Ok(tools)
+    }
+
+    // Delete stale sessions older than `days`
+    pub async fn cleanup_stale_sessions(&self, days: i64) -> BridgeResult<u64> {
+        let url = format!(
+            "{}/api/internal/whatsapp/sessions/stale?days={}",
+            self.base_url, days
+        );
+        let resp = self
+            .client
+            .delete(&url)
+            .header("X-Internal-Secret", &self.secret)
+            .send()
+            .await
+            .map_err(BridgeError::StoreNetwork)?;
+
+        if !resp.status().is_success() {
+            return Err(BridgeError::Store {
+                status: resp.status().as_u16(),
+                message: "Stale session cleanup failed".to_string(),
+            });
+        }
+        let body: serde_json::Value = resp.json().await?;
+        Ok(body.get("deleted").and_then(|v| v.as_u64()).unwrap_or(0))
     }
 
     // Get tenant downstream auth
@@ -152,6 +186,43 @@ impl StoreClient {
                     .unwrap_or_default()
             }
             _ => DownstreamAuth::default(),
+        }
+    }
+
+    /// Log a failed message to the dead-letter queue.
+    /// Fire-and-forget: errors are logged but not propagated.
+    pub async fn log_failed_message(
+        &self,
+        tenant_id: &str,
+        customer_phone: &str,
+        message_text: &str,
+        error_type: &str,
+        error_detail: &str,
+    ) {
+        let url = format!("{}/api/internal/whatsapp/failed-messages", self.base_url);
+        let body = serde_json::json!({
+            "tenant_id": tenant_id,
+            "customer_phone": customer_phone,
+            "message_text": message_text,
+            "error_type": error_type,
+            "error_detail": error_detail,
+        });
+
+        match self
+            .client
+            .post(&url)
+            .header("X-Internal-Secret", &self.secret)
+            .json(&body)
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {}
+            Ok(resp) => {
+                app_log!(warn, status = %resp.status(), "Failed to log dead letter to store");
+            }
+            Err(e) => {
+                app_log!(warn, error = %e, "Failed to log dead letter to store (network)");
+            }
         }
     }
 }

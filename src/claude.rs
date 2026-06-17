@@ -1,18 +1,24 @@
+use crate::circuit_breaker::CircuitBreaker;
+use crate::error::{BridgeError, BridgeResult};
 use crate::models::{
     ClaudeMessage, ClaudeRequest, ClaudeResponse, ClaudeTool, ContentBlock, DownstreamAuth,
     McpTool,
 };
-use anyhow::{anyhow, Result};
 use graflog::app_log;
+use std::sync::Arc;
 
 const CLAUDE_API_URL: &str = "https://api.anthropic.com/v1/messages";
 const MAX_TOOL_ROUNDS: usize = 10;
+const MAX_RETRIES: u32 = 3;
+// Backoff: 1s, 2s, 4s
+const BACKOFF_BASE_MS: u64 = 1000;
 
 pub struct ClaudeClient {
     api_key: String,
     model: String,
     max_tokens: u32,
     http: reqwest::Client,
+    circuit: Arc<CircuitBreaker>,
 }
 
 impl ClaudeClient {
@@ -22,6 +28,7 @@ impl ClaudeClient {
             model,
             max_tokens,
             http: reqwest::Client::new(),
+            circuit: Arc::new(CircuitBreaker::new()),
         }
     }
 
@@ -36,7 +43,7 @@ impl ClaudeClient {
         user_message: &str,
         tools: &[McpTool],
         downstream_auth: &DownstreamAuth,
-    ) -> Result<(String, Vec<ClaudeMessage>)> {
+    ) -> BridgeResult<(String, Vec<ClaudeMessage>)> {
         let claude_tools: Vec<ClaudeTool> = tools.iter().map(to_claude_tool).collect();
 
         let mut messages = history;
@@ -54,7 +61,7 @@ impl ClaudeClient {
                 messages: messages.clone(),
             };
 
-            let resp = self.call_api(&req).await?;
+            let resp = self.call_api_with_retry(&req).await?;
 
             match resp.stop_reason.as_str() {
                 "end_turn" => {
@@ -74,7 +81,7 @@ impl ClaudeClient {
                         content: serde_json::json!(content_blocks_to_value(&resp.content)),
                     });
 
-                    // Execute every tool_use block in parallel
+                    // Execute every tool_use block
                     let mut results = vec![];
                     for block in &resp.content {
                         if block.block_type == "tool_use" {
@@ -119,10 +126,64 @@ impl ClaudeClient {
             }
         }
 
-        Err(anyhow!("Tool call loop exceeded {} rounds", MAX_TOOL_ROUNDS))
+        Err(BridgeError::ToolLoopExhausted { max_rounds: MAX_TOOL_ROUNDS })
     }
 
-    async fn call_api(&self, req: &ClaudeRequest) -> Result<ClaudeResponse> {
+    /// Call Claude API with exponential backoff retry and circuit breaker.
+    async fn call_api_with_retry(&self, req: &ClaudeRequest) -> BridgeResult<ClaudeResponse> {
+        // Circuit breaker check
+        if !self.circuit.allow_request() {
+            app_log!(warn, "Claude circuit breaker is OPEN — rejecting request");
+            return Err(BridgeError::CircuitOpen);
+        }
+
+        let mut last_err = BridgeError::Other("No attempts made".into());
+
+        for attempt in 0..MAX_RETRIES {
+            match self.call_api(req).await {
+                Ok(resp) => {
+                    self.circuit.record_success();
+                    return Ok(resp);
+                }
+                Err(e) => {
+                    let retryable = matches!(
+                        &e,
+                        BridgeError::ClaudeNetwork(_)
+                            | BridgeError::ClaudeApi { status: 429, .. }
+                            | BridgeError::ClaudeApi { status: 500..=599, .. }
+                    );
+
+                    if !retryable || attempt == MAX_RETRIES - 1 {
+                        // Non-retryable or exhausted retries
+                        self.circuit.record_failure();
+                        app_log!(
+                            error,
+                            attempt = attempt + 1,
+                            error = %e,
+                            "Claude API call failed (not retrying)"
+                        );
+                        return Err(e);
+                    }
+
+                    let backoff_ms = BACKOFF_BASE_MS * 2u64.pow(attempt);
+                    app_log!(
+                        warn,
+                        attempt = attempt + 1,
+                        backoff_ms = backoff_ms,
+                        error = %e,
+                        "Claude API call failed, retrying"
+                    );
+                    tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
+                    last_err = e;
+                }
+            }
+        }
+
+        self.circuit.record_failure();
+        Err(last_err)
+    }
+
+    async fn call_api(&self, req: &ClaudeRequest) -> BridgeResult<ClaudeResponse> {
         let resp = self
             .http
             .post(CLAUDE_API_URL)
@@ -131,14 +192,15 @@ impl ClaudeClient {
             .header("content-type", "application/json")
             .json(req)
             .send()
-            .await?;
+            .await
+            .map_err(BridgeError::ClaudeNetwork)?;
 
         if !resp.status().is_success() {
-            let status = resp.status();
+            let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
-            return Err(anyhow!("Claude API error {}: {}", status, body));
+            return Err(BridgeError::ClaudeApi { status, body });
         }
-        Ok(resp.json().await?)
+        resp.json().await.map_err(BridgeError::ClaudeParse)
     }
 }
 

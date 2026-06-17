@@ -1,8 +1,14 @@
+use crate::error::{BridgeError, BridgeResult};
 use crate::models::{WaMessage, WebhookPayload};
+use crate::rate_limit::RateLimitDenied;
 use crate::AppState;
 use actix_web::{web, HttpRequest, HttpResponse, Responder};
 use graflog::app_log;
+use hmac::{Hmac, Mac};
 use serde::Deserialize;
+use sha2::Sha256;
+
+type HmacSha256 = Hmac<Sha256>;
 
 // ── GET /webhook/{tenant_id}  — Meta hub verification ────────────────────────
 
@@ -55,16 +61,65 @@ pub async fn verify(
 
 // ── POST /webhook/{tenant_id}  — incoming messages ───────────────────────────
 
+/// Validate the X-Hub-Signature-256 header against the raw request body.
+/// Meta signs every webhook POST with HMAC-SHA256 using the app secret.
+/// Returns Ok(()) on valid signature, Err(reason) on failure.
+fn validate_signature(secret: &str, signature_header: &str, body: &[u8]) -> Result<(), String> {
+    // Header format: "sha256=<hex>"
+    let hex_sig = signature_header
+        .strip_prefix("sha256=")
+        .ok_or_else(|| "Missing sha256= prefix".to_string())?;
+
+    let expected_bytes = hex::decode(hex_sig)
+        .map_err(|_| "Invalid hex in signature header".to_string())?;
+
+    let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
+        .map_err(|_| "Invalid HMAC key".to_string())?;
+
+    mac.update(body);
+
+    mac.verify_slice(&expected_bytes)
+        .map_err(|_| "Signature mismatch".to_string())
+}
+
 pub async fn incoming(
     state: web::Data<AppState>,
     path: web::Path<String>,
-    _req: HttpRequest,
-    payload: web::Json<WebhookPayload>,
+    req: HttpRequest,
+    body: web::Bytes,
 ) -> impl Responder {
+    // ── Signature validation ────────────────────────────────────────────────
+    if let Some(ref secret) = state.meta_app_secret {
+        let sig_header = req
+            .headers()
+            .get("X-Hub-Signature-256")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+
+        if sig_header.is_empty() {
+            app_log!(warn, "Webhook POST missing X-Hub-Signature-256 header");
+            return HttpResponse::Unauthorized().body("Missing signature");
+        }
+
+        if let Err(reason) = validate_signature(secret, sig_header, &body) {
+            app_log!(warn, reason = %reason, "Webhook signature validation failed");
+            return HttpResponse::Unauthorized().body("Invalid signature");
+        }
+    }
+    // If META_APP_SECRET is not set, skip validation (logged as warning at startup)
+
+    // ── Parse JSON payload ──────────────────────────────────────────────────
+    let payload: WebhookPayload = match serde_json::from_slice(&body) {
+        Ok(p) => p,
+        Err(e) => {
+            app_log!(error, error = %e, "Failed to parse webhook payload");
+            return HttpResponse::BadRequest().body("Invalid payload");
+        }
+    };
+
     // Respond 200 immediately — Meta retries if we're slow
     let tenant_id = path.into_inner();
     let state = state.into_inner();
-    let payload = payload.into_inner();
 
     tokio::spawn(async move {
         if let Err(e) = process_payload(state, tenant_id, payload).await {
@@ -79,7 +134,7 @@ async fn process_payload(
     state: std::sync::Arc<AppState>,
     tenant_id: String,
     payload: WebhookPayload,
-) -> anyhow::Result<()> {
+) -> BridgeResult<()> {
     if payload.object != "whatsapp_business_account" {
         return Ok(());
     }
@@ -95,10 +150,39 @@ async fn process_payload(
                 None => continue,
             };
             for msg in messages {
+                // Capture metadata before handle_message consumes msg
+                let customer_phone = msg.from.clone();
+                let msg_text_preview = msg.text.as_ref()
+                    .map(|t| t.body.chars().take(500).collect::<String>())
+                    .unwrap_or_default();
+
                 if let Err(e) =
                     handle_message(&state, &tenant_id, &phone_number_id, msg).await
                 {
                     app_log!(error, error = %e, "Failed to handle WA message");
+
+                    // Classify error type for the dead-letter record
+                    let error_type = match &e {
+                        BridgeError::ClaudeApi { .. } => "ClaudeApi",
+                        BridgeError::ClaudeNetwork(_) => "ClaudeNetwork",
+                        BridgeError::ClaudeParse(_) => "ClaudeParse",
+                        BridgeError::CircuitOpen => "CircuitOpen",
+                        BridgeError::ToolLoopExhausted { .. } => "ToolLoopExhausted",
+                        BridgeError::Store { .. } => "Store",
+                        BridgeError::StoreNetwork(_) => "StoreNetwork",
+                        BridgeError::WhatsAppApi { .. } => "WhatsAppApi",
+                        BridgeError::WhatsAppNetwork(_) => "WhatsAppNetwork",
+                        BridgeError::ChannelNotFound(_) => "ChannelNotFound",
+                        BridgeError::Other(_) => "Other",
+                    };
+
+                    state.store.log_failed_message(
+                        &tenant_id,
+                        &customer_phone,
+                        &msg_text_preview,
+                        error_type,
+                        &e.to_string(),
+                    ).await;
                 }
             }
         }
@@ -111,7 +195,7 @@ async fn handle_message(
     tenant_id: &str,
     phone_number_id: &str,
     msg: WaMessage,
-) -> anyhow::Result<()> {
+) -> BridgeResult<()> {
     // Only handle text messages for now
     let text = match (msg.msg_type.as_str(), msg.text) {
         ("text", Some(t)) => t.body,
@@ -122,6 +206,32 @@ async fn handle_message(
     };
 
     let customer_phone = &msg.from;
+
+    // ── Rate limit check (before any Claude / tool call work) ───────────
+    if let Err(denied) = state.rate_limiter.check_and_record(tenant_id, customer_phone).await {
+        let reason = match denied {
+            RateLimitDenied::Phone => "per-phone",
+            RateLimitDenied::Tenant => "per-tenant",
+        };
+        app_log!(
+            warn,
+            tenant_id = %tenant_id,
+            customer = %customer_phone,
+            limit = %reason,
+            "Rate limited WA message"
+        );
+        // Load channel to send a polite "slow down" reply
+        if let Ok(Some(channel)) = state.store.get_channel(phone_number_id).await {
+            let _ = state.wa.send_text(
+                phone_number_id,
+                &channel.wa_token,
+                customer_phone,
+                "You're sending messages too quickly. Please wait a moment and try again.",
+            ).await;
+        }
+        return Ok(());
+    }
+
     app_log!(
         info,
         tenant_id = %tenant_id,
@@ -161,10 +271,22 @@ async fn handle_message(
         channel.system_prompt.clone()
     };
 
-    let (reply, updated_history) = state
+    let (reply, updated_history) = match state
         .claude
         .run(&system, history, &text, &tools, &auth)
-        .await?;
+        .await
+    {
+        Ok(result) => result,
+        Err(BridgeError::CircuitOpen) => {
+            app_log!(warn, tenant_id = %tenant_id, "Circuit open — sending unavailable message");
+            let _ = state.wa.send_text(
+                phone_number_id, &channel.wa_token, customer_phone,
+                "I'm temporarily unavailable. Please try again in a few moments.",
+            ).await;
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    };
 
     // Send reply to customer
     state

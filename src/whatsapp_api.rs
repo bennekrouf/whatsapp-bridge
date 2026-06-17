@@ -1,4 +1,4 @@
-use anyhow::Result;
+use crate::error::{BridgeError, BridgeResult};
 use graflog::app_log;
 
 pub struct WhatsAppClient {
@@ -16,7 +16,7 @@ impl WhatsAppClient {
         wa_token: &str,
         to: &str,
         text: &str,
-    ) -> Result<()> {
+    ) -> BridgeResult<()> {
         let url = format!(
             "https://graph.facebook.com/v19.0/{}/messages",
             phone_number_id
@@ -36,16 +36,18 @@ impl WhatsAppClient {
             .bearer_auth(wa_token)
             .json(&body)
             .send()
-            .await?;
+            .await
+            .map_err(BridgeError::WhatsAppNetwork)?;
 
         if resp.status().is_success() {
             app_log!(info, to = %to, "WA message sent");
+            Ok(())
         } else {
-            let status = resp.status();
-            let err = resp.text().await.unwrap_or_default();
-            app_log!(error, to = %to, status = %status, err = %err, "WA send failed");
+            let status = resp.status().as_u16();
+            let err_body = resp.text().await.unwrap_or_default();
+            app_log!(error, to = %to, status = %status, err = %err_body, "WA send failed");
+            Err(BridgeError::WhatsAppApi { status, body: err_body })
         }
-        Ok(())
     }
 
     /// Send a "typing…" indicator so the user knows we're working on it

@@ -1,6 +1,9 @@
+mod circuit_breaker;
 mod claude;
 mod config;
+pub mod error;
 mod models;
+mod rate_limit;
 mod store_client;
 mod webhook;
 mod whatsapp_api;
@@ -9,6 +12,7 @@ use actix_web::{web, App, HttpResponse, HttpServer};
 use claude::ClaudeClient;
 use config::Config;
 use graflog::{app_log, init_logging, LogOption};
+use rate_limit::RateLimiter;
 use std::sync::Arc;
 use store_client::StoreClient;
 use whatsapp_api::WhatsAppClient;
@@ -17,6 +21,8 @@ pub struct AppState {
     pub store: StoreClient,
     pub wa: WhatsAppClient,
     pub claude: ClaudeClient,
+    pub meta_app_secret: Option<String>,
+    pub rate_limiter: RateLimiter,
 }
 
 #[actix_web::main]
@@ -42,9 +48,17 @@ async fn main() -> std::io::Result<()> {
         std::process::exit(1);
     });
 
+    let meta_app_secret = std::env::var("META_APP_SECRET").ok();
+    if meta_app_secret.is_none() {
+        app_log!(warn, "META_APP_SECRET not set — webhook signature validation DISABLED (unsafe for production)");
+    }
+
     app_log!(info, "WhatsApp bridge starting on {}:{}", config.server.host, config.server.port);
     app_log!(info, "Store: {}", config.store.address);
     app_log!(info, "Claude model: {}", config.claude.model);
+
+    let rate_limiter = RateLimiter::new();
+    app_log!(info, "Rate limiter initialised");
 
     let state = Arc::new(AppState {
         store: StoreClient::new(config.store.address.clone()),
@@ -54,7 +68,26 @@ async fn main() -> std::io::Result<()> {
             config.claude.model.clone(),
             config.claude.max_tokens,
         ),
+        meta_app_secret,
+        rate_limiter,
     });
+
+    // Background task: cleanup stale WA sessions once per day
+    {
+        let store = StoreClient::new(config.store.address.clone());
+        tokio::spawn(async move {
+            let interval = tokio::time::Duration::from_secs(24 * 60 * 60); // 24h
+            // Run first cleanup 60s after startup, then every 24h
+            tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+            loop {
+                match store.cleanup_stale_sessions(30).await {
+                    Ok(n) => app_log!(info, deleted = %n, "Stale session cleanup completed"),
+                    Err(e) => app_log!(error, error = %e, "Stale session cleanup failed"),
+                }
+                tokio::time::sleep(interval).await;
+            }
+        });
+    }
 
     let addr = format!("{}:{}", config.server.host, config.server.port);
 

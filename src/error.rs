@@ -42,6 +42,13 @@ pub enum BridgeError {
     #[error("WhatsApp API unreachable: {0}")]
     WhatsAppNetwork(#[source] reqwest::Error),
 
+    // ── Telegram errors ──────────────────────────────────────────────────────
+    #[error("Telegram API error (HTTP {status}): {body}")]
+    TelegramApi { status: u16, body: String },
+
+    #[error("Telegram API unreachable: {0}")]
+    TelegramNetwork(#[source] reqwest::Error),
+
     // ── Channel / config errors ──────────────────────────────────────────────
     #[error("No channel config found for phone_number_id={0}")]
     ChannelNotFound(String),

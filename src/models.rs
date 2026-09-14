@@ -111,3 +111,14 @@ pub struct ResolvedIdentity {
     /// Their own api0 key, pinned to this tenant. Used for every tool call.
     pub api_key: String,
 }
+
+/// A tenant's bot on a messaging platform, as the bridge needs it.
+#[derive(Debug, Clone)]
+pub struct MessagingChannel {
+    pub tenant_id: String,
+    /// The platform credential — a Telegram bot token, say.
+    pub credential: String,
+    /// Presented by the platform on every update; proves the caller is them.
+    pub webhook_secret: String,
+    pub system_prompt: String,
+}

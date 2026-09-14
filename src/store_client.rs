@@ -1,5 +1,5 @@
 use crate::error::{BridgeError, BridgeResult};
-use crate::models::{ChannelInfo, ClaudeMessage, DownstreamAuth, McpTool};
+use crate::models::{ChannelInfo, ClaudeMessage, ResolvedIdentity};
 use graflog::app_log;
 
 pub struct StoreClient {
@@ -127,21 +127,6 @@ impl StoreClient {
         Ok(())
     }
 
-    // Get tenant MCP tools
-    pub async fn get_tools(&self, tenant_id: &str) -> BridgeResult<Vec<McpTool>> {
-        let url = format!("{}/api/mcp-tools/{}", self.base_url, urlencoding::encode(tenant_id));
-        let resp = self.client.get(&url).send().await.map_err(BridgeError::StoreNetwork)?;
-        if !resp.status().is_success() {
-            return Ok(vec![]);
-        }
-        let body: serde_json::Value = resp.json().await?;
-        let tools = body
-            .get("tools")
-            .and_then(|t| serde_json::from_value(t.clone()).ok())
-            .unwrap_or_default();
-        Ok(tools)
-    }
-
     // Delete stale sessions older than `days`
     pub async fn cleanup_stale_sessions(&self, days: i64) -> BridgeResult<u64> {
         let url = format!(
@@ -167,25 +152,85 @@ impl StoreClient {
     }
 
     // Get tenant downstream auth
-    pub async fn get_downstream_auth(&self, tenant_id: &str) -> DownstreamAuth {
+    // ── Identity ─────────────────────────────────────────────────────────────
+
+    /// The person behind a messaging identity in this tenant, with the api0 key
+    /// minted for them. `None` means nobody has linked this identity yet.
+    pub async fn resolve_identity(
+        &self,
+        channel: &str,
+        external_id: &str,
+        tenant_id: &str,
+    ) -> BridgeResult<Option<ResolvedIdentity>> {
         let url = format!(
-            "{}/api/tenant/downstream-auth/{}",
+            "{}/api/internal/channel-identities/resolve?channel={}&external_id={}&tenant_id={}",
             self.base_url,
-            urlencoding::encode(tenant_id)
+            urlencoding::encode(channel),
+            urlencoding::encode(external_id),
+            urlencoding::encode(tenant_id),
         );
-        match self
+        let resp = self
             .client
             .get(&url)
             .header("X-Internal-Secret", &self.secret)
             .send()
             .await
-        {
-            Ok(r) if r.status().is_success() => {
-                let body: serde_json::Value = r.json().await.unwrap_or_default();
-                serde_json::from_value(body.get("auth").cloned().unwrap_or_default())
-                    .unwrap_or_default()
+            .map_err(BridgeError::StoreNetwork)?;
+
+        match resp.status().as_u16() {
+            200 => {
+                let body: serde_json::Value = resp.json().await?;
+                Ok(Some(ResolvedIdentity {
+                    user_email: body["user_email"].as_str().unwrap_or_default().to_string(),
+                    api_key: body["api_key"].as_str().unwrap_or_default().to_string(),
+                }))
             }
-            _ => DownstreamAuth::default(),
+            404 => Ok(None),
+            status => {
+                let body: serde_json::Value = resp.json().await.unwrap_or_default();
+                Err(BridgeError::Store {
+                    status,
+                    message: body["error"].as_str().unwrap_or("identity lookup failed").to_string(),
+                })
+            }
+        }
+    }
+
+    /// Redeem a link code sent from a messaging identity. On success, returns
+    /// the email it is now linked to.
+    pub async fn redeem_link_code(
+        &self,
+        channel: &str,
+        external_id: &str,
+        tenant_id: &str,
+        code: &str,
+    ) -> BridgeResult<String> {
+        let url = format!("{}/api/internal/channel-identities/redeem", self.base_url);
+        let resp = self
+            .client
+            .post(&url)
+            .header("X-Internal-Secret", &self.secret)
+            .json(&serde_json::json!({
+                "channel": channel,
+                "external_id": external_id,
+                "tenant_id": tenant_id,
+                "code": code,
+            }))
+            .send()
+            .await
+            .map_err(BridgeError::StoreNetwork)?;
+
+        let status = resp.status().as_u16();
+        let body: serde_json::Value = resp.json().await.unwrap_or_default();
+        if status == 200 {
+            Ok(body["identity"]["user_email"].as_str().unwrap_or_default().to_string())
+        } else {
+            // The store's message is written for the person — "that code has
+            // expired" — so it is handed straight back to them.
+            Err(BridgeError::Store {
+                status,
+                message: body["error"].as_str().unwrap_or("could not link").to_string(),
+            })
         }
     }
 

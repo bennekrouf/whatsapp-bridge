@@ -5,6 +5,7 @@ use std::path::Path;
 pub struct Config {
     pub server: ServerConfig,
     pub store: StoreConfig,
+    pub gateway: GatewayConfig,
     pub claude: ClaudeConfig,
 }
 
@@ -16,6 +17,13 @@ pub struct ServerConfig {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct StoreConfig {
+    pub address: String,
+}
+
+/// The api0 gateway — where tool calls actually go. Every message runs as an
+/// MCP client of it, with the linked person's own key.
+#[derive(Debug, Deserialize, Clone)]
+pub struct GatewayConfig {
     pub address: String,
 }
 

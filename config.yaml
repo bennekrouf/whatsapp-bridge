@@ -5,6 +5,11 @@ server:
 store:
   address: "http://127.0.0.1:5007"
 
+# The api0 gateway. Every tool call goes here as an MCP client, with the linked
+# person's own key — the bridge never executes a tool itself.
+gateway:
+  address: "http://127.0.0.1:5009"
+
 claude:
   model: "claude-sonnet-4-20250514"
   max_tokens: 1024

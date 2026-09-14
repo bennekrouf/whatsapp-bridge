@@ -62,7 +62,14 @@ async fn main() -> std::io::Result<()> {
     }
 
     app_log!(info, "WhatsApp bridge starting on {}:{}", config.server.host, config.server.port);
+    app_log!(info, "Config: {}", config_path);
     app_log!(info, "Store: {}", config.store.address);
+    // Logged because this is the value most likely to be wrong on a deployed
+    // host: the gateway's config.yaml says 5009, but its pm2 definition sets
+    // API0__SERVER__PORT=50054 and the env override wins. Pointed at the wrong
+    // one, linking still succeeds and every tool call fails — so it has to be
+    // visible at startup rather than inferred from a failure later.
+    app_log!(info, "Gateway: {}", config.gateway.address);
     app_log!(info, "Claude model: {}", config.claude.model);
 
     let rate_limiter = RateLimiter::new();

@@ -1,5 +1,5 @@
 use crate::error::{BridgeError, BridgeResult};
-use crate::models::{ChannelInfo, ClaudeMessage, ResolvedIdentity};
+use crate::models::{ChannelInfo, ClaudeMessage, MessagingChannel, ResolvedIdentity};
 use graflog::app_log;
 
 pub struct StoreClient {
@@ -152,6 +152,43 @@ impl StoreClient {
     }
 
     // Get tenant downstream auth
+    // ── Messaging channels (generic) ─────────────────────────────────────────
+
+    /// A tenant's bot on a platform, by what the platform sends us to route on.
+    pub async fn get_messaging_channel(
+        &self,
+        channel: &str,
+        channel_ref: &str,
+    ) -> BridgeResult<Option<MessagingChannel>> {
+        let url = format!(
+            "{}/api/internal/messaging-channels/{}/{}",
+            self.base_url,
+            urlencoding::encode(channel),
+            urlencoding::encode(channel_ref),
+        );
+        let resp = self
+            .client
+            .get(&url)
+            .header("X-Internal-Secret", &self.secret)
+            .send()
+            .await
+            .map_err(BridgeError::StoreNetwork)?;
+
+        match resp.status().as_u16() {
+            200 => {
+                let b: serde_json::Value = resp.json().await?;
+                Ok(Some(MessagingChannel {
+                    tenant_id: b["tenant_id"].as_str().unwrap_or_default().to_string(),
+                    credential: b["credential"].as_str().unwrap_or_default().to_string(),
+                    webhook_secret: b["webhook_secret"].as_str().unwrap_or_default().to_string(),
+                    system_prompt: b["system_prompt"].as_str().unwrap_or_default().to_string(),
+                }))
+            }
+            404 => Ok(None),
+            status => Err(BridgeError::Store { status, message: "channel lookup failed".into() }),
+        }
+    }
+
     // ── Identity ─────────────────────────────────────────────────────────────
 
     /// The person behind a messaging identity in this tenant, with the api0 key

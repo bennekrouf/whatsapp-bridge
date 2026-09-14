@@ -7,6 +7,9 @@ use mcp_client::McpClient;
 mod models;
 mod rate_limit;
 mod store_client;
+mod telegram_api;
+mod telegram_webhook;
+mod turn;
 mod webhook;
 mod whatsapp_api;
 
@@ -18,11 +21,13 @@ use rate_limit::RateLimiter;
 use std::sync::Arc;
 use store_client::StoreClient;
 use whatsapp_api::WhatsAppClient;
+use telegram_api::TelegramClient;
 
 pub struct AppState {
     pub store: StoreClient,
     pub mcp: McpClient,
     pub wa: WhatsAppClient,
+    pub telegram: TelegramClient,
     pub claude: ClaudeClient,
     pub meta_app_secret: Option<String>,
     pub rate_limiter: RateLimiter,
@@ -67,6 +72,7 @@ async fn main() -> std::io::Result<()> {
         store: StoreClient::new(config.store.address.clone()),
         mcp: McpClient::new(&config.gateway.address),
         wa: WhatsAppClient::new(),
+        telegram: TelegramClient::new(),
         claude: ClaudeClient::new(
             claude_api_key,
             config.claude.model.clone(),
@@ -104,6 +110,8 @@ async fn main() -> std::io::Result<()> {
             // Meta webhook routes — one URL per tenant
             .route("/webhook/{tenant_id}", web::get().to(webhook::verify))
             .route("/webhook/{tenant_id}", web::post().to(webhook::incoming))
+            // Telegram delivers every update here; the bot id routes to a tenant.
+            .route("/telegram/webhook/{bot_id}", web::post().to(telegram_webhook::incoming))
     })
     .bind(&addr)?
     .run()

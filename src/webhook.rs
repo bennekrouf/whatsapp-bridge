@@ -1,8 +1,8 @@
 use crate::error::{BridgeError, BridgeResult};
 use crate::models::{WaMessage, WebhookPayload};
-use crate::rate_limit::RateLimitDenied;
 use crate::AppState;
 use actix_web::{web, HttpRequest, HttpResponse, Responder};
+use crate::turn::{run_turn, Inbound};
 use graflog::app_log;
 use hmac::{Hmac, Mac};
 use serde::Deserialize;
@@ -174,6 +174,8 @@ async fn process_payload(
                         BridgeError::Gateway(_) => "Gateway",
                         BridgeError::WhatsAppApi { .. } => "WhatsAppApi",
                         BridgeError::WhatsAppNetwork(_) => "WhatsAppNetwork",
+                        BridgeError::TelegramApi { .. } => "TelegramApi",
+                        BridgeError::TelegramNetwork(_) => "TelegramNetwork",
                         BridgeError::ChannelNotFound(_) => "ChannelNotFound",
                         BridgeError::Other(_) => "Other",
                     };
@@ -196,18 +198,7 @@ async fn process_payload(
 /// "telegram"; nothing else about linking would change.
 const CHANNEL: &str = "whatsapp";
 
-const LINK_INSTRUCTIONS: &str = "This number isn't linked to an account yet.\n\n\
-Sign in at the dashboard, open Settings → Linked messaging, and send me the \
-6-character code it shows you. After that, everything you ask here runs as you.";
 
-/// A link code is six characters from an unambiguous alphabet. A message that
-/// is exactly that, give or take whitespace and case, is treated as one.
-fn looks_like_link_code(text: &str) -> Option<String> {
-    let t = text.trim().to_uppercase();
-    let ok = t.len() == 6
-        && t.bytes().all(|b| b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789".contains(&b));
-    if ok { Some(t) } else { None }
-}
 
 async fn handle_message(
     state: &AppState,
@@ -226,39 +217,9 @@ async fn handle_message(
 
     let customer_phone = &msg.from;
 
-    // ── Rate limit check (before any Claude / tool call work) ───────────
-    if let Err(denied) = state.rate_limiter.check_and_record(tenant_id, customer_phone).await {
-        let reason = match denied {
-            RateLimitDenied::Phone => "per-phone",
-            RateLimitDenied::Tenant => "per-tenant",
-        };
-        app_log!(
-            warn,
-            tenant_id = %tenant_id,
-            customer = %customer_phone,
-            limit = %reason,
-            "Rate limited WA message"
-        );
-        // Load channel to send a polite "slow down" reply
-        if let Ok(Some(channel)) = state.store.get_channel(phone_number_id).await {
-            let _ = state.wa.send_text(
-                phone_number_id,
-                &channel.wa_token,
-                customer_phone,
-                "You're sending messages too quickly. Please wait a moment and try again.",
-            ).await;
-        }
-        return Ok(());
-    }
+    app_log!(info, tenant_id = %tenant_id, customer = %customer_phone, "WA message received");
 
-    app_log!(
-        info,
-        tenant_id = %tenant_id,
-        customer = %customer_phone,
-        "WA message received"
-    );
-
-    // Load channel config (wa_token + system_prompt)
+    // Channel config: token to reply with, prompt to think with.
     let channel = match state.store.get_channel(phone_number_id).await? {
         Some(c) => c,
         None => {
@@ -268,87 +229,24 @@ async fn handle_message(
     };
 
     // Mark message as read (shows the customer we received it)
-    state
-        .wa
-        .mark_read(phone_number_id, &channel.wa_token, &msg.id)
-        .await;
+    state.wa.mark_read(phone_number_id, &channel.wa_token, &msg.id).await;
 
-    // ── Who is this? ────────────────────────────────────────────────────
-    // A phone number is not an api0 person. Someone becomes one by sending a
-    // code minted in the dashboard; from then on their own key is used, so every
-    // tool call carries their own credentials and their own name.
-    let identity = state
-        .store
-        .resolve_identity(CHANNEL, customer_phone, tenant_id)
-        .await?;
+    // Everything that is not WhatsApp-specific happens in one place.
+    let reply = run_turn(
+        state,
+        Inbound {
+            channel: CHANNEL,
+            external_id: customer_phone,
+            tenant_id,
+            system_prompt: &channel.system_prompt,
+            text: &text,
+        },
+    )
+    .await?;
 
-    let identity = match identity {
-        Some(id) => id,
-        None => {
-            // Not linked. If this looks like a code, redeem it; otherwise explain.
-            let reply = if let Some(code) = looks_like_link_code(&text) {
-                match state.store.redeem_link_code(CHANNEL, customer_phone, tenant_id, &code).await {
-                    Ok(email) => format!(
-                        "Linked. You are now {} here — anything you ask runs as you.",
-                        email
-                    ),
-                    Err(BridgeError::Store { message, .. }) => message,
-                    Err(e) => return Err(e),
-                }
-            } else {
-                LINK_INSTRUCTIONS.to_string()
-            };
-            state
-                .wa
-                .send_text(phone_number_id, &channel.wa_token, customer_phone, &reply)
-                .await?;
-            return Ok(());
-        }
-    };
-
-    app_log!(info, tenant_id = %tenant_id, user = %identity.user_email, "Acting as linked person");
-
-    // Load conversation history
-    let history = state.store.get_session(tenant_id, customer_phone).await?;
-
-    // The tools this person may use, as the gateway sees them for their key.
-    let tools = state.mcp.list_tools(&identity.api_key).await?;
-
-    // Run Claude
-    let system = if channel.system_prompt.is_empty() {
-        "You are a helpful assistant. Use the available tools to answer the user's request."
-            .to_string()
-    } else {
-        channel.system_prompt.clone()
-    };
-
-    let (reply, updated_history) = match state
-        .claude
-        .run(&system, history, &text, &tools, &state.mcp, &identity.api_key)
-        .await
-    {
-        Ok(result) => result,
-        Err(BridgeError::CircuitOpen) => {
-            app_log!(warn, tenant_id = %tenant_id, "Circuit open — sending unavailable message");
-            let _ = state.wa.send_text(
-                phone_number_id, &channel.wa_token, customer_phone,
-                "I'm temporarily unavailable. Please try again in a few moments.",
-            ).await;
-            return Ok(());
-        }
-        Err(e) => return Err(e),
-    };
-
-    // Send reply to customer
     state
         .wa
         .send_text(phone_number_id, &channel.wa_token, customer_phone, &reply)
-        .await?;
-
-    // Save updated conversation history
-    state
-        .store
-        .save_session(tenant_id, customer_phone, &updated_history)
         .await?;
 
     app_log!(
@@ -361,21 +259,3 @@ async fn handle_message(
     Ok(())
 }
 
-#[cfg(test)]
-mod link_code_tests {
-    use super::looks_like_link_code;
-
-    #[test]
-    fn a_six_character_code_is_recognised_whatever_the_case_or_spacing() {
-        assert_eq!(looks_like_link_code("abc234"), Some("ABC234".into()));
-        assert_eq!(looks_like_link_code("  KLMN78 "), Some("KLMN78".into()));
-    }
-
-    #[test]
-    fn ordinary_messages_are_not_mistaken_for_codes() {
-        // Wrong length, ambiguous characters, or plain words.
-        for text in ["hello", "ABCDE", "ABCDEFG", "AB0123", "list my tasks", "OI1LO0"] {
-            assert_eq!(looks_like_link_code(text), None, "{text:?} should not be a code");
-        }
-    }
-}

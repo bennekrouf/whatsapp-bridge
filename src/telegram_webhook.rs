@@ -16,7 +16,6 @@ use crate::AppState;
 use actix_web::{web, HttpRequest, HttpResponse};
 use graflog::app_log;
 use serde::Deserialize;
-use std::sync::Arc;
 
 pub const CHANNEL: &str = "telegram";
 
@@ -55,7 +54,7 @@ fn unwrap_start_payload(text: &str) -> &str {
 
 pub async fn incoming(
     req: HttpRequest,
-    state: web::Data<Arc<AppState>>,
+    state: web::Data<AppState>,
     path: web::Path<String>,
     body: web::Json<Update>,
 ) -> HttpResponse {

@@ -1,0 +1,28 @@
+# Production configuration for the messaging bridge (WhatsApp + Telegram).
+#
+# Loaded via CONFIG_PATH=config_production.yaml in ecosystem.config.js. The dev
+# config.yaml stays pointed at local ports; this file is the one the production
+# host actually reads, because the two differ in exactly one dangerous way: the
+# gateway's port.
+
+server:
+  host: "0.0.0.0"
+  port: 8095
+
+# The store's HTTP API. config.yaml in the store pins this to 127.0.0.1:5007
+# and pm2 does not override it.
+store:
+  address: "http://127.0.0.1:5007"
+
+# The api0 gateway. Every tool call goes here as an MCP client, with the linked
+# person's own key — the bridge never executes a tool itself.
+#
+# NOT 5009. The gateway's config.yaml says 5009, but its pm2 definition sets
+# API0__SERVER__PORT=50054, and the env override wins. A bridge pointed at 5009
+# in production reaches nothing and every message fails at the tools/list call.
+gateway:
+  address: "http://127.0.0.1:50054"
+
+claude:
+  model: "claude-sonnet-4-20250514"
+  max_tokens: 1024

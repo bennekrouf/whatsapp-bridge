@@ -102,28 +102,12 @@ pub struct ContentBlock {
     pub input: Option<serde_json::Value>,
 }
 
-// ── MCP tool from store ───────────────────────────────────────────────────────
+// ── Identity ──────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize, Clone)]
-pub struct McpTool {
-    pub tool_name: String,
-    pub backend_url: String,
-    pub description: String,
-    pub input_schema: String, // JSON string
-    pub http_verb: Option<String>,
-    pub timeout_ms: i64,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct McpToolsResponse {
-    pub tools: Vec<McpTool>,
-}
-
-// ── Downstream auth ───────────────────────────────────────────────────────────
-
-#[derive(Debug, Deserialize, Clone, Default)]
-pub struct DownstreamAuth {
-    pub auth_mode: Option<String>,
-    pub bearer_token: Option<String>,
-    pub custom_headers: Option<serde_json::Value>,
+/// A messaging identity resolved to the api0 person behind it.
+#[derive(Debug, Clone)]
+pub struct ResolvedIdentity {
+    pub user_email: String,
+    /// Their own api0 key, pinned to this tenant. Used for every tool call.
+    pub api_key: String,
 }

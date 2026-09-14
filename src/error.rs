@@ -28,6 +28,13 @@ pub enum BridgeError {
     #[error("Store unreachable: {0}")]
     StoreNetwork(#[source] reqwest::Error),
 
+    // ── Gateway (MCP) errors ─────────────────────────────────────────────────
+    #[error("Gateway unreachable: {0}")]
+    GatewayNetwork(#[source] reqwest::Error),
+
+    #[error("Gateway error: {0}")]
+    Gateway(String),
+
     // ── Meta / WhatsApp errors ───────────────────────────────────────────────
     #[error("WhatsApp API error (HTTP {status}): {body}")]
     WhatsAppApi { status: u16, body: String },

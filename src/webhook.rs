@@ -170,6 +170,8 @@ async fn process_payload(
                         BridgeError::ToolLoopExhausted { .. } => "ToolLoopExhausted",
                         BridgeError::Store { .. } => "Store",
                         BridgeError::StoreNetwork(_) => "StoreNetwork",
+                        BridgeError::GatewayNetwork(_) => "GatewayNetwork",
+                        BridgeError::Gateway(_) => "Gateway",
                         BridgeError::WhatsAppApi { .. } => "WhatsAppApi",
                         BridgeError::WhatsAppNetwork(_) => "WhatsAppNetwork",
                         BridgeError::ChannelNotFound(_) => "ChannelNotFound",
@@ -188,6 +190,23 @@ async fn process_payload(
         }
     }
     Ok(())
+}
+
+/// What this bridge is, to the identity store. A Telegram bridge would say
+/// "telegram"; nothing else about linking would change.
+const CHANNEL: &str = "whatsapp";
+
+const LINK_INSTRUCTIONS: &str = "This number isn't linked to an account yet.\n\n\
+Sign in at the dashboard, open Settings → Linked messaging, and send me the \
+6-character code it shows you. After that, everything you ask here runs as you.";
+
+/// A link code is six characters from an unambiguous alphabet. A message that
+/// is exactly that, give or take whitespace and case, is treated as one.
+fn looks_like_link_code(text: &str) -> Option<String> {
+    let t = text.trim().to_uppercase();
+    let ok = t.len() == 6
+        && t.bytes().all(|b| b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789".contains(&b));
+    if ok { Some(t) } else { None }
 }
 
 async fn handle_message(
@@ -254,14 +273,46 @@ async fn handle_message(
         .mark_read(phone_number_id, &channel.wa_token, &msg.id)
         .await;
 
+    // ── Who is this? ────────────────────────────────────────────────────
+    // A phone number is not an api0 person. Someone becomes one by sending a
+    // code minted in the dashboard; from then on their own key is used, so every
+    // tool call carries their own credentials and their own name.
+    let identity = state
+        .store
+        .resolve_identity(CHANNEL, customer_phone, tenant_id)
+        .await?;
+
+    let identity = match identity {
+        Some(id) => id,
+        None => {
+            // Not linked. If this looks like a code, redeem it; otherwise explain.
+            let reply = if let Some(code) = looks_like_link_code(&text) {
+                match state.store.redeem_link_code(CHANNEL, customer_phone, tenant_id, &code).await {
+                    Ok(email) => format!(
+                        "Linked. You are now {} here — anything you ask runs as you.",
+                        email
+                    ),
+                    Err(BridgeError::Store { message, .. }) => message,
+                    Err(e) => return Err(e),
+                }
+            } else {
+                LINK_INSTRUCTIONS.to_string()
+            };
+            state
+                .wa
+                .send_text(phone_number_id, &channel.wa_token, customer_phone, &reply)
+                .await?;
+            return Ok(());
+        }
+    };
+
+    app_log!(info, tenant_id = %tenant_id, user = %identity.user_email, "Acting as linked person");
+
     // Load conversation history
     let history = state.store.get_session(tenant_id, customer_phone).await?;
 
-    // Load tenant's MCP tools
-    let tools = state.store.get_tools(tenant_id).await?;
-
-    // Load tenant's downstream auth
-    let auth = state.store.get_downstream_auth(tenant_id).await;
+    // The tools this person may use, as the gateway sees them for their key.
+    let tools = state.mcp.list_tools(&identity.api_key).await?;
 
     // Run Claude
     let system = if channel.system_prompt.is_empty() {
@@ -273,7 +324,7 @@ async fn handle_message(
 
     let (reply, updated_history) = match state
         .claude
-        .run(&system, history, &text, &tools, &auth)
+        .run(&system, history, &text, &tools, &state.mcp, &identity.api_key)
         .await
     {
         Ok(result) => result,
@@ -308,4 +359,23 @@ async fn handle_message(
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod link_code_tests {
+    use super::looks_like_link_code;
+
+    #[test]
+    fn a_six_character_code_is_recognised_whatever_the_case_or_spacing() {
+        assert_eq!(looks_like_link_code("abc234"), Some("ABC234".into()));
+        assert_eq!(looks_like_link_code("  KLMN78 "), Some("KLMN78".into()));
+    }
+
+    #[test]
+    fn ordinary_messages_are_not_mistaken_for_codes() {
+        // Wrong length, ambiguous characters, or plain words.
+        for text in ["hello", "ABCDE", "ABCDEFG", "AB0123", "list my tasks", "OI1LO0"] {
+            assert_eq!(looks_like_link_code(text), None, "{text:?} should not be a code");
+        }
+    }
 }

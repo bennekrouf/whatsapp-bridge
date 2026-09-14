@@ -1,9 +1,7 @@
 use crate::circuit_breaker::CircuitBreaker;
 use crate::error::{BridgeError, BridgeResult};
-use crate::models::{
-    ClaudeMessage, ClaudeRequest, ClaudeResponse, ClaudeTool, ContentBlock, DownstreamAuth,
-    McpTool,
-};
+use crate::mcp_client::{McpClient, Tool};
+use crate::models::{ClaudeMessage, ClaudeRequest, ClaudeResponse, ClaudeTool, ContentBlock};
 use graflog::app_log;
 use std::sync::Arc;
 
@@ -36,13 +34,18 @@ impl ClaudeClient {
     /// - Appends the user message to history
     /// - Loops through tool calls until Claude gives a final text response
     /// - Returns (reply_text, updated_history)
+    ///
+    /// Every tool call goes to the gateway with `api_key` — the linked person's
+    /// own key — so it runs with their credentials and is attributed to them.
+    /// This function knows nothing about how a tool is executed, and must not.
     pub async fn run(
         &self,
         system_prompt: &str,
         history: Vec<ClaudeMessage>,
         user_message: &str,
-        tools: &[McpTool],
-        downstream_auth: &DownstreamAuth,
+        tools: &[Tool],
+        mcp: &McpClient,
+        api_key: &str,
     ) -> BridgeResult<(String, Vec<ClaudeMessage>)> {
         let claude_tools: Vec<ClaudeTool> = tools.iter().map(to_claude_tool).collect();
 
@@ -89,21 +92,18 @@ impl ClaudeClient {
                             let tool_name = block.name.clone().unwrap_or_default();
                             let input = block.input.clone().unwrap_or(serde_json::json!({}));
 
-                            let result = execute_tool(
-                                tools,
-                                &tool_name,
-                                &input,
-                                downstream_auth,
-                                &self.http,
-                            )
-                            .await;
+                            let outcome = mcp.call_tool(api_key, &tool_name, &input).await;
 
-                            app_log!(info, tool = %tool_name, "Tool executed");
+                            app_log!(info, tool = %tool_name, is_error = outcome.is_error, "Tool executed via gateway");
 
+                            // Claude's tool_result carries is_error too, so the
+                            // model treats a refusal as something to work around
+                            // rather than as an answer.
                             results.push(serde_json::json!({
                                 "type":        "tool_result",
                                 "tool_use_id": tool_id,
-                                "content":     result,
+                                "content":     outcome.text,
+                                "is_error":    outcome.is_error,
                             }));
                         }
                     }
@@ -206,68 +206,13 @@ impl ClaudeClient {
 
 // ── Tool execution ────────────────────────────────────────────────────────────
 
-async fn execute_tool(
-    tools: &[McpTool],
-    name: &str,
-    input: &serde_json::Value,
-    auth: &DownstreamAuth,
-    client: &reqwest::Client,
-) -> String {
-    let tool = match tools.iter().find(|t| t.tool_name == name) {
-        Some(t) => t,
-        None => return format!("Error: unknown tool '{}'", name),
-    };
-
-    let verb = tool.http_verb.as_deref().unwrap_or("POST");
-    let timeout = std::time::Duration::from_millis(tool.timeout_ms as u64);
-
-    let mut builder = match verb.to_uppercase().as_str() {
-        "GET"    => client.get(&tool.backend_url),
-        "DELETE" => client.delete(&tool.backend_url),
-        "PUT"    => client.put(&tool.backend_url).json(input),
-        "PATCH"  => client.patch(&tool.backend_url).json(input),
-        _        => client.post(&tool.backend_url).json(input),
-    };
-
-    builder = builder.timeout(timeout);
-
-    // Apply downstream auth
-    match auth.auth_mode.as_deref() {
-        Some("static_bearer") => {
-            if let Some(token) = &auth.bearer_token {
-                builder = builder.bearer_auth(token);
-            }
-        }
-        Some("header_injection") => {
-            if let Some(headers) = &auth.custom_headers {
-                if let Some(obj) = headers.as_object() {
-                    for (k, v) in obj {
-                        if let Some(v_str) = v.as_str() {
-                            builder = builder.header(k.as_str(), v_str);
-                        }
-                    }
-                }
-            }
-        }
-        _ => {}
-    }
-
-    match builder.send().await {
-        Ok(resp) => resp.text().await.unwrap_or_else(|_| "empty response".into()),
-        Err(e)   => format!("Tool call failed: {}", e),
-    }
-}
-
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-fn to_claude_tool(t: &McpTool) -> ClaudeTool {
-    let schema = serde_json::from_str(&t.input_schema).unwrap_or_else(|_| {
-        serde_json::json!({"type": "object", "properties": {}})
-    });
+fn to_claude_tool(t: &Tool) -> ClaudeTool {
     ClaudeTool {
-        name: t.tool_name.clone(),
+        name: t.name.clone(),
         description: t.description.clone(),
-        input_schema: schema,
+        input_schema: t.input_schema.clone(),
     }
 }
 

@@ -2,6 +2,8 @@ mod circuit_breaker;
 mod claude;
 mod config;
 pub mod error;
+mod mcp_client;
+use mcp_client::McpClient;
 mod models;
 mod rate_limit;
 mod store_client;
@@ -19,6 +21,7 @@ use whatsapp_api::WhatsAppClient;
 
 pub struct AppState {
     pub store: StoreClient,
+    pub mcp: McpClient,
     pub wa: WhatsAppClient,
     pub claude: ClaudeClient,
     pub meta_app_secret: Option<String>,
@@ -62,6 +65,7 @@ async fn main() -> std::io::Result<()> {
 
     let state = Arc::new(AppState {
         store: StoreClient::new(config.store.address.clone()),
+        mcp: McpClient::new(&config.gateway.address),
         wa: WhatsAppClient::new(),
         claude: ClaudeClient::new(
             claude_api_key,

@@ -181,6 +181,7 @@ async fn process_payload(
                     };
 
                     state.store.log_failed_message(
+                        CHANNEL,
                         &tenant_id,
                         &customer_phone,
                         &msg_text_preview,

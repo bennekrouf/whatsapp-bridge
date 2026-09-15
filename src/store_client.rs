@@ -17,6 +17,23 @@ impl StoreClient {
         }
     }
 
+    /// Whether the store answers its health check — the bridge can do nothing
+    /// without it, so a bridge that is up but cut off from the store is down.
+    pub async fn ping(&self) -> Result<(), String> {
+        let resp = self
+            .client
+            .get(format!("{}/api/health", self.base_url))
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await
+            .map_err(|e| format!("could not reach the store: {}", e))?;
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            Err(format!("the store answered {}", resp.status().as_u16()))
+        }
+    }
+
     // Look up channel config by phone_number_id
     pub async fn get_channel(&self, phone_number_id: &str) -> BridgeResult<Option<ChannelInfo>> {
         let url = format!(
@@ -275,6 +292,7 @@ impl StoreClient {
     /// Fire-and-forget: errors are logged but not propagated.
     pub async fn log_failed_message(
         &self,
+        channel: &str,
         tenant_id: &str,
         customer_phone: &str,
         message_text: &str,
@@ -283,6 +301,7 @@ impl StoreClient {
     ) {
         let url = format!("{}/api/internal/whatsapp/failed-messages", self.base_url);
         let body = serde_json::json!({
+            "channel": channel,
             "tenant_id": tenant_id,
             "customer_phone": customer_phone,
             "message_text": message_text,

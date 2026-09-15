@@ -60,7 +60,7 @@ async fn main() -> std::io::Result<()> {
 
     let meta_app_secret = std::env::var("META_APP_SECRET").ok();
     if meta_app_secret.is_none() {
-        app_log!(warn, "META_APP_SECRET not set — webhook signature validation DISABLED (unsafe for production)");
+        app_log!(warn, "META_APP_SECRET not set — WhatsApp tenants without their own App Secret are NOT signature-checked");
     }
 
     app_log!(info, "WhatsApp bridge starting on {}:{}", config.server.host, config.server.port);

@@ -55,6 +55,28 @@ impl McpClient {
         }
     }
 
+    /// Whether the configured gateway address answers as an api0 gateway.
+    ///
+    /// Sent without a key, so the only good answers are the MCP route refusing
+    /// it (401) or accepting it. A 404 is the classic misconfiguration: some
+    /// other service — or nothing that speaks MCP — on the configured port, which
+    /// lets linking succeed while every tool call fails.
+    pub async fn check(&self) -> Result<(), String> {
+        let resp = self
+            .http
+            .post(&self.endpoint)
+            .timeout(std::time::Duration::from_secs(5))
+            .json(&json!({ "jsonrpc": "2.0", "id": 0, "method": "ping" }))
+            .send()
+            .await
+            .map_err(|e| format!("could not reach the gateway at {}: {}", self.endpoint, e))?;
+        match resp.status().as_u16() {
+            200..=299 | 401 => Ok(()),
+            404 => Err(format!("{} has no MCP route — is the gateway address or port wrong?", self.endpoint)),
+            other => Err(format!("{} answered {}", self.endpoint, other)),
+        }
+    }
+
     /// The tools this key may use — the person's tenant, as the gateway sees it.
     pub async fn list_tools(&self, api_key: &str) -> BridgeResult<Vec<Tool>> {
         let result = self.call(api_key, "tools/list", json!({})).await?;

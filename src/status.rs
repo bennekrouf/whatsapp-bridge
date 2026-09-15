@@ -40,7 +40,8 @@ pub async fn status(req: HttpRequest, state: web::Data<AppState>) -> HttpRespons
             .json(serde_json::json!({"success": false, "error": "Unauthorized"}));
     }
 
-    let (claude, store) = tokio::join!(state.claude.check_key(), state.store.ping());
+    let (claude, store, gateway) =
+        tokio::join!(state.claude.check_key(), state.store.ping(), state.mcp.check());
 
     let circuit = match state.claude.circuit_state() {
         CircuitState::Closed => "closed",
@@ -64,6 +65,12 @@ pub async fn status(req: HttpRequest, state: web::Data<AppState>) -> HttpRespons
             "circuit": circuit,
         },
         "store": leg(store),
+        // Every tool call goes here; a wrong address or port still lets linking work.
+        "gateway": leg(gateway),
+        // Whether the platform-wide META_APP_SECRET is set. It is only the
+        // fallback for tenants that have not given their own App Secret, so its
+        // absence is not by itself a hole — the WhatsApp connector test says,
+        // per tenant, whether its webhooks are actually checked.
         "webhook_signature_validation": state.meta_app_secret.is_some(),
     }))
 }

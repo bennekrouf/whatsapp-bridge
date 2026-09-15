@@ -48,6 +48,8 @@ pub async fn run_turn(state: &AppState, m: Inbound<'_>) -> BridgeResult<String> 
     let sender_key = format!("{}:{}", m.channel, m.external_id);
 
     if let Err(denied) = state.rate_limiter.check_and_record(m.tenant_id, &sender_key).await {
+        // Delivered, just not answered: still proof the platform reaches us.
+        state.store.record_inbound(m.channel, m.tenant_id, None).await;
         let reason = match denied {
             RateLimitDenied::Phone => "per-sender",
             RateLimitDenied::Tenant => "per-tenant",
@@ -60,11 +62,18 @@ pub async fn run_turn(state: &AppState, m: Inbound<'_>) -> BridgeResult<String> 
     // A platform id is not an api0 person. Someone becomes one by sending a
     // code minted in the dashboard; from then on their own key is used, so every
     // tool call carries their own credentials and their own name.
-    let identity = match state
+    let resolved = state
         .store
         .resolve_identity(m.channel, m.external_id, m.tenant_id)
-        .await?
-    {
+        .await;
+
+    // Recorded here, before anything can fail on the way to a reply: this is the
+    // only trace a message from someone not yet linked leaves, and the only way
+    // to tell "nobody has messaged the bot" from "the platform never delivered".
+    let linked = resolved.as_ref().ok().map(|id| id.is_some());
+    state.store.record_inbound(m.channel, m.tenant_id, linked).await;
+
+    let identity = match resolved? {
         Some(id) => id,
         None => {
             let reply = match looks_like_link_code(m.text) {

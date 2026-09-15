@@ -53,6 +53,10 @@ pub struct ChannelInfo {
     pub wa_token: String,
     pub verify_token: String,
     pub system_prompt: String,
+    /// The tenant's Meta App Secret, if they gave one. Absent from a store that
+    /// predates it, hence the default.
+    #[serde(default)]
+    pub app_secret: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

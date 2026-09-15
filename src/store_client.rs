@@ -288,6 +288,30 @@ impl StoreClient {
         }
     }
 
+    /// Record that a platform delivered a message for this tenant's channel.
+    /// Best effort with a short timeout: a failure here must never cost the
+    /// person their reply.
+    pub async fn record_inbound(&self, channel: &str, tenant_id: &str, linked: Option<bool>) {
+        let url = format!("{}/api/internal/channel-inbound", self.base_url);
+        let result = self
+            .client
+            .post(&url)
+            .header("X-Internal-Secret", &self.secret)
+            .timeout(std::time::Duration::from_secs(2))
+            .json(&serde_json::json!({
+                "channel": channel,
+                "tenant_id": tenant_id,
+                "linked": linked,
+            }))
+            .send()
+            .await;
+        match result {
+            Ok(resp) if resp.status().is_success() => {}
+            Ok(resp) => app_log!(warn, status = %resp.status(), "Could not record inbound delivery"),
+            Err(e) => app_log!(warn, error = %e, "Could not record inbound delivery (network)"),
+        }
+    }
+
     /// Log a failed message to the dead-letter queue.
     /// Fire-and-forget: errors are logged but not propagated.
     pub async fn log_failed_message(

@@ -88,25 +88,59 @@ pub async fn incoming(
     req: HttpRequest,
     body: web::Bytes,
 ) -> impl Responder {
+    let tenant_id = path.into_inner();
+
     // ── Signature validation ────────────────────────────────────────────────
-    if let Some(ref secret) = state.meta_app_secret {
-        let sig_header = req
-            .headers()
-            .get("X-Hub-Signature-256")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-
-        if sig_header.is_empty() {
-            app_log!(warn, "Webhook POST missing X-Hub-Signature-256 header");
-            return HttpResponse::Unauthorized().body("Missing signature");
+    // Meta signs with the App Secret of the app the webhook is configured on,
+    // and every tenant brings its own app. So the secret is the tenant's first;
+    // the platform's META_APP_SECRET only covers a tenant that has not given one
+    // (and is right for at most one app). One shared secret for everyone would
+    // reject every other tenant's messages with a 401 that Meta retries forever.
+    let channel = match state.store.get_channel_by_tenant(&tenant_id).await {
+        Ok(Some(ch)) => ch,
+        Ok(None) => {
+            app_log!(warn, tenant_id = %tenant_id, "Webhook POST for a tenant with no WhatsApp channel");
+            return HttpResponse::NotFound().body("Unknown tenant");
         }
+        Err(e) => {
+            // 5xx on purpose: Meta retries, and the message is not lost to a blip.
+            app_log!(error, error = %e, tenant_id = %tenant_id, "Webhook POST: channel lookup failed");
+            return HttpResponse::InternalServerError().body("Channel lookup failed");
+        }
+    };
 
-        if let Err(reason) = validate_signature(secret, sig_header, &body) {
-            app_log!(warn, reason = %reason, "Webhook signature validation failed");
-            return HttpResponse::Unauthorized().body("Invalid signature");
+    let tenant_secret = channel
+        .get("app_secret")
+        .and_then(|v| v.as_str())
+        .filter(|v| !v.is_empty())
+        .map(str::to_string);
+
+    match tenant_secret.or_else(|| state.meta_app_secret.clone()) {
+        Some(secret) => {
+            let sig_header = req
+                .headers()
+                .get("X-Hub-Signature-256")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+
+            if sig_header.is_empty() {
+                app_log!(warn, tenant_id = %tenant_id, "Webhook POST missing X-Hub-Signature-256 header");
+                return HttpResponse::Unauthorized().body("Missing signature");
+            }
+
+            if let Err(reason) = validate_signature(&secret, sig_header, &body) {
+                app_log!(warn, tenant_id = %tenant_id, reason = %reason, "Webhook signature validation failed");
+                return HttpResponse::Unauthorized().body("Invalid signature");
+            }
+        }
+        None => {
+            app_log!(
+                warn,
+                tenant_id = %tenant_id,
+                "Webhook POST accepted UNSIGNED-CHECKED: no App Secret for this tenant and no META_APP_SECRET"
+            );
         }
     }
-    // If META_APP_SECRET is not set, skip validation (logged as warning at startup)
 
     // ── Parse JSON payload ──────────────────────────────────────────────────
     let payload: WebhookPayload = match serde_json::from_slice(&body) {
@@ -118,7 +152,6 @@ pub async fn incoming(
     };
 
     // Respond 200 immediately — Meta retries if we're slow
-    let tenant_id = path.into_inner();
     let state = state.into_inner();
 
     tokio::spawn(async move {
@@ -228,6 +261,20 @@ async fn handle_message(
             return Ok(());
         }
     };
+
+    // The URL names the tenant and the payload names the number; they must be
+    // the same channel. Otherwise a payload signed with one tenant's secret could
+    // name another tenant's number, and run a turn in one tenant while replying
+    // with the other's token.
+    if channel.tenant_id != tenant_id {
+        app_log!(
+            warn,
+            url_tenant = %tenant_id,
+            number_tenant = %channel.tenant_id,
+            "WA payload names a number belonging to a different tenant — ignored"
+        );
+        return Ok(());
+    }
 
     // Mark message as read (shows the customer we received it)
     state.wa.mark_read(phone_number_id, &channel.wa_token, &msg.id).await;

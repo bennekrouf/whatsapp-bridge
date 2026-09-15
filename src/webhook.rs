@@ -82,6 +82,33 @@ fn validate_signature(secret: &str, signature_header: &str, body: &[u8]) -> Resu
         .map_err(|_| "Signature mismatch".to_string())
 }
 
+/// How to treat a webhook POST's signature, given what secrets exist.
+#[derive(Debug, PartialEq)]
+pub enum SignaturePolicy {
+    /// Verify against this secret.
+    Check(String),
+    /// No secret, and the operator explicitly allowed unsigned webhooks.
+    AllowUnsigned,
+    /// No secret and no override: refuse.
+    Refuse,
+}
+
+/// The tenant's own App Secret wins — Meta signs with the secret of the app the
+/// webhook is configured on, and every tenant brings its own app. The platform's
+/// META_APP_SECRET is the fallback. With neither, the answer is no, unless the
+/// operator opted out for local development.
+pub fn signature_policy(
+    tenant_secret: Option<String>,
+    platform_secret: Option<String>,
+    allow_unsigned: bool,
+) -> SignaturePolicy {
+    match tenant_secret.or(platform_secret) {
+        Some(secret) => SignaturePolicy::Check(secret),
+        None if allow_unsigned => SignaturePolicy::AllowUnsigned,
+        None => SignaturePolicy::Refuse,
+    }
+}
+
 pub async fn incoming(
     state: web::Data<AppState>,
     path: web::Path<String>,
@@ -115,8 +142,8 @@ pub async fn incoming(
         .filter(|v| !v.is_empty())
         .map(str::to_string);
 
-    match tenant_secret.or_else(|| state.meta_app_secret.clone()) {
-        Some(secret) => {
+    match signature_policy(tenant_secret, state.meta_app_secret.clone(), state.allow_unsigned_webhooks) {
+        SignaturePolicy::Check(secret) => {
             let sig_header = req
                 .headers()
                 .get("X-Hub-Signature-256")
@@ -133,12 +160,24 @@ pub async fn incoming(
                 return HttpResponse::Unauthorized().body("Invalid signature");
             }
         }
-        None => {
+        SignaturePolicy::AllowUnsigned => {
             app_log!(
                 warn,
                 tenant_id = %tenant_id,
-                "Webhook POST accepted UNSIGNED-CHECKED: no App Secret for this tenant and no META_APP_SECRET"
+                "Webhook POST accepted WITHOUT a signature check (ALLOW_UNSIGNED_WEBHOOKS is on)"
             );
+        }
+        // Fail closed. The bridge acts as whoever the payload's sender is linked
+        // to, with their own api0 key — so an unchecked POST from anyone who
+        // knows the webhook URL and a linked phone number would run tools as
+        // that person. No secret means no way to tell Meta from them.
+        SignaturePolicy::Refuse => {
+            app_log!(
+                warn,
+                tenant_id = %tenant_id,
+                "Webhook POST refused: no App Secret for this tenant and no META_APP_SECRET"
+            );
+            return HttpResponse::Unauthorized().body("No App Secret configured for this workspace");
         }
     }
 
@@ -307,3 +346,43 @@ async fn handle_message(
     Ok(())
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::{signature_policy, SignaturePolicy};
+
+    fn some(s: &str) -> Option<String> {
+        Some(s.to_string())
+    }
+
+    #[test]
+    fn the_tenants_own_secret_wins_over_the_platforms() {
+        assert_eq!(
+            signature_policy(some("tenant"), some("platform"), false),
+            SignaturePolicy::Check("tenant".into())
+        );
+    }
+
+    #[test]
+    fn the_platform_secret_covers_a_tenant_without_one() {
+        assert_eq!(
+            signature_policy(None, some("platform"), false),
+            SignaturePolicy::Check("platform".into())
+        );
+    }
+
+    #[test]
+    fn no_secret_at_all_is_refused_by_default() {
+        assert_eq!(signature_policy(None, None, false), SignaturePolicy::Refuse);
+    }
+
+    #[test]
+    fn unsigned_is_only_accepted_when_explicitly_allowed() {
+        assert_eq!(signature_policy(None, None, true), SignaturePolicy::AllowUnsigned);
+        // The override never downgrades a check that a secret makes possible.
+        assert_eq!(
+            signature_policy(some("tenant"), None, true),
+            SignaturePolicy::Check("tenant".into())
+        );
+    }
+}

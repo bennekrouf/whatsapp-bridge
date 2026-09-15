@@ -33,6 +33,9 @@ pub struct AppState {
     pub meta_app_secret: Option<String>,
     pub rate_limiter: RateLimiter,
     pub started_at: chrono::DateTime<chrono::Utc>,
+    /// Accept WhatsApp webhooks with no signature check when neither the tenant
+    /// nor the platform has a secret. For local development only.
+    pub allow_unsigned_webhooks: bool,
 }
 
 #[actix_web::main]
@@ -58,9 +61,21 @@ async fn main() -> std::io::Result<()> {
         std::process::exit(1);
     });
 
-    let meta_app_secret = std::env::var("META_APP_SECRET").ok();
+    let meta_app_secret = std::env::var("META_APP_SECRET").ok().filter(|v| !v.is_empty());
     if meta_app_secret.is_none() {
-        app_log!(warn, "META_APP_SECRET not set — WhatsApp tenants without their own App Secret are NOT signature-checked");
+        app_log!(warn, "META_APP_SECRET not set — WhatsApp tenants without their own App Secret have their messages refused");
+    }
+
+    let allow_unsigned_webhooks = std::env::var("ALLOW_UNSIGNED_WEBHOOKS")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
+    if allow_unsigned_webhooks {
+        // Loud on purpose: left on in production, anyone who knows a webhook URL
+        // and a linked phone number can run tools as that person.
+        app_log!(
+            error,
+            "ALLOW_UNSIGNED_WEBHOOKS is ON — WhatsApp webhooks without a secret are accepted UNCHECKED. Never use this in production."
+        );
     }
 
     app_log!(info, "WhatsApp bridge starting on {}:{}", config.server.host, config.server.port);
@@ -90,6 +105,7 @@ async fn main() -> std::io::Result<()> {
         meta_app_secret,
         rate_limiter,
         started_at: chrono::Utc::now(),
+        allow_unsigned_webhooks,
     });
 
     // Background task: cleanup stale WA sessions once per day

@@ -6,6 +6,7 @@ mod mcp_client;
 use mcp_client::McpClient;
 mod models;
 mod rate_limit;
+mod status;
 mod store_client;
 mod telegram_api;
 mod telegram_webhook;
@@ -31,6 +32,7 @@ pub struct AppState {
     pub claude: ClaudeClient,
     pub meta_app_secret: Option<String>,
     pub rate_limiter: RateLimiter,
+    pub started_at: chrono::DateTime<chrono::Utc>,
 }
 
 #[actix_web::main]
@@ -87,6 +89,7 @@ async fn main() -> std::io::Result<()> {
         ),
         meta_app_secret,
         rate_limiter,
+        started_at: chrono::Utc::now(),
     });
 
     // Background task: cleanup stale WA sessions once per day
@@ -114,6 +117,9 @@ async fn main() -> std::io::Result<()> {
             .route("/health", web::get().to(|| async {
                 HttpResponse::Ok().json(serde_json::json!({"status": "ok"}))
             }))
+            // What the admin panel reads: version, and whether Claude and the
+            // store are usable from here. Internal-secret only.
+            .route("/internal/status", web::get().to(status::status))
             // Meta webhook routes — one URL per tenant
             .route("/webhook/{tenant_id}", web::get().to(webhook::verify))
             .route("/webhook/{tenant_id}", web::post().to(webhook::incoming))

@@ -1,4 +1,4 @@
-use crate::circuit_breaker::CircuitBreaker;
+use crate::circuit_breaker::{CircuitBreaker, CircuitState};
 use crate::error::{BridgeError, BridgeResult};
 use crate::mcp_client::{McpClient, Tool};
 use crate::models::{ClaudeMessage, ClaudeRequest, ClaudeResponse, ClaudeTool, ContentBlock};
@@ -6,6 +6,8 @@ use graflog::app_log;
 use std::sync::Arc;
 
 const CLAUDE_API_URL: &str = "https://api.anthropic.com/v1/messages";
+/// Listing models costs nothing and still authenticates the key.
+const CLAUDE_MODELS_URL: &str = "https://api.anthropic.com/v1/models?limit=1";
 const MAX_TOOL_ROUNDS: usize = 10;
 const MAX_RETRIES: u32 = 3;
 // Backoff: 1s, 2s, 4s
@@ -28,6 +30,42 @@ impl ClaudeClient {
             http: reqwest::Client::new(),
             circuit: Arc::new(CircuitBreaker::new()),
         }
+    }
+
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    pub fn circuit_state(&self) -> CircuitState {
+        self.circuit.state()
+    }
+
+    /// Whether Anthropic accepts the key, without spending a token.
+    ///
+    /// Deliberately outside the circuit breaker: this is how an operator finds
+    /// out *why* the circuit opened, so it must not be refused by it, and a
+    /// failed check must not count toward tripping it.
+    pub async fn check_key(&self) -> Result<(), String> {
+        let resp = self
+            .http
+            .get(CLAUDE_MODELS_URL)
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", "2023-06-01")
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await
+            .map_err(|e| format!("could not reach Anthropic: {}", e))?;
+
+        if resp.status().is_success() {
+            return Ok(());
+        }
+        let status = resp.status().as_u16();
+        let body: serde_json::Value = resp.json().await.unwrap_or_default();
+        Err(format!(
+            "Anthropic answered {}: {}",
+            status,
+            body["error"]["message"].as_str().unwrap_or("no detail")
+        ))
     }
 
     /// Run a full conversation turn:

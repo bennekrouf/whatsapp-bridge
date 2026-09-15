@@ -121,7 +121,7 @@ pub async fn incoming(
             };
             state
                 .store
-                .log_failed_message(&channel.tenant_id, &external_id, &text, error_type, &e.to_string())
+                .log_failed_message(CHANNEL, &channel.tenant_id, &external_id, &text, error_type, &e.to_string())
                 .await;
             "Something went wrong on my side. Please try again in a moment.".to_string()
         }

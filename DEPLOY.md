@@ -16,6 +16,14 @@ pm2 process  api0-whatsapp-bridge
        └─ execs   /opt/api0/bin/whatsapp-bridge
 ```
 
+Both are version-controlled here:
+
+- `deploy/run-whatsapp-bridge.sh` — the wrapper. The host's copy at
+  `/opt/api0/run-whatsapp-bridge.sh` should be a **symlink** to it, so the file
+  in git keeps describing what actually runs.
+- `deploy/whatsapp-bridge.env.example` — the shape of the env file. The real
+  `/opt/api0/whatsapp-bridge.env` holds secrets and is not in git.
+
 `whatsapp-bridge.env` holds `CLAUDE_API_KEY`, `API0_INTERNAL_SECRET`, optionally
 `META_APP_SECRET`, plus `LOG_PATH_API0` and `CONFIG_PATH`.
 

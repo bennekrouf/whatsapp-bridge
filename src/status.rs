@@ -68,9 +68,11 @@ pub async fn status(req: HttpRequest, state: web::Data<AppState>) -> HttpRespons
         // Every tool call goes here; a wrong address or port still lets linking work.
         "gateway": leg(gateway),
         // Whether the platform-wide META_APP_SECRET is set. It is only the
-        // fallback for tenants that have not given their own App Secret, so its
-        // absence is not by itself a hole — the WhatsApp connector test says,
-        // per tenant, whether its webhooks are actually checked.
+        // fallback for tenants that have not given their own App Secret; without
+        // either, a tenant's messages are refused — the WhatsApp connector test
+        // says, per tenant, which case applies.
         "webhook_signature_validation": state.meta_app_secret.is_some(),
+        // The development override. Must be false in production.
+        "allow_unsigned_webhooks": state.allow_unsigned_webhooks,
     }))
 }

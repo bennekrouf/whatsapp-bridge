@@ -27,6 +27,12 @@ Both are version-controlled here:
 `whatsapp-bridge.env` holds `CLAUDE_API_KEY`, `API0_INTERNAL_SECRET`, optionally
 `META_APP_SECRET`, plus `LOG_PATH_API0` and `CONFIG_PATH`.
 
+WhatsApp webhooks are checked against the tenant's own App Secret (saved with
+its channel), falling back to `META_APP_SECRET`. A tenant with neither has its
+messages refused with 401 — the dashboard's WhatsApp **Test** says so. The
+`ALLOW_UNSIGNED_WEBHOOKS=true` override accepts them unchecked and exists for
+local development only; the bridge logs an error at startup when it is on.
+
 `CONFIG_PATH` must point at **`config_production.yaml`**, not `config.yaml`.
 Both live in the source tree and differ in one value that matters:
 

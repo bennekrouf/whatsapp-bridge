@@ -34,20 +34,23 @@ messages refused with 401 — the dashboard's WhatsApp **Test** says so. The
 local development only; the bridge logs an error at startup when it is on.
 
 `CONFIG_PATH` must point at **`config_production.yaml`**, not `config.yaml`.
-Both live in the source tree and differ in one value that matters:
 
-| | `config.yaml` (dev) | `config_production.yaml` |
-|---|---|---|
-| gateway | `127.0.0.1:5009` | `127.0.0.1:50054` |
+Both point the bridge at the gateway on **`127.0.0.1:5009`** — the port the
+gateway actually listens on, and the one nginx proxies `gateway.api0.ai` to.
+PM2 sets `API0__SERVER__PORT=50054` for the gateway, but that override has no
+effect; a bridge pointed at 50054 links accounts fine and then fails every
+message with "Gateway unreachable". To check on the host:
 
-The gateway's own `config.yaml` says 5009, but its pm2 definition sets
-`API0__SERVER__PORT=50054` and the env override wins. Pointed at 5009 in
-production, linking an account still succeeds and every tool call fails — the
-failure shows up far from its cause, so the address is logged at startup:
+```
+sudo ss -ltnp | grep gateway            # the gateway's real port
+pm2 logs api0-whatsapp-bridge | grep Gateway:
+```
+
+The bridge logs the address at startup:
 
 ```
 Config: /opt/api0/src/whatsapp-bridge/config_production.yaml
-Gateway: http://127.0.0.1:50054
+Gateway: http://127.0.0.1:5009
 ```
 
 ## Updating

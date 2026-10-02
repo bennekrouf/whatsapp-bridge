@@ -42,6 +42,7 @@ pub async fn status(req: HttpRequest, state: web::Data<AppState>) -> HttpRespons
 
     let (claude, store, gateway) =
         tokio::join!(state.claude.check_key(), state.store.ping(), state.mcp.check());
+    let llm = state.claude.settings().await;
 
     let circuit = match state.claude.circuit_state() {
         CircuitState::Closed => "closed",
@@ -60,7 +61,8 @@ pub async fn status(req: HttpRequest, state: web::Data<AppState>) -> HttpRespons
         // list it — the exact failure the connector test otherwise infers from a 404.
         "channels": ["whatsapp", "telegram"],
         "claude": {
-            "model": state.claude.model(),
+            "provider": llm.provider,
+            "model": llm.model,
             "key": leg(claude),
             "circuit": circuit,
         },

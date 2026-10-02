@@ -35,6 +35,34 @@ impl StoreClient {
     }
 
     // Look up channel config by phone_number_id
+    /// The super admin's choice of AI provider, model and key for the
+    /// assistant. `Ok(None)` when none is configured — the bridge then uses its
+    /// own built-in Claude key.
+    pub async fn assistant_config(&self) -> Result<Option<crate::claude::LlmSettings>, String> {
+        let resp = self
+            .client
+            .get(format!("{}/api/internal/assistant-config", self.base_url))
+            .header("X-Internal-Secret", &self.secret)
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await
+            .map_err(|e| format!("could not reach the store: {}", e))?;
+        if !resp.status().is_success() {
+            return Err(format!("the store answered {}", resp.status().as_u16()));
+        }
+        let body: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+        if !body["configured"].as_bool().unwrap_or(false) {
+            return Ok(None);
+        }
+        let field = |k: &str| body[k].as_str().map(str::to_string).ok_or_else(|| format!("missing {}", k));
+        Ok(Some(crate::claude::LlmSettings {
+            provider: field("provider")?,
+            base_url: field("base_url")?,
+            api_key: field("api_key")?,
+            model: field("model")?,
+        }))
+    }
+
     pub async fn get_channel(&self, phone_number_id: &str) -> BridgeResult<Option<ChannelInfo>> {
         let url = format!(
             "{}/api/internal/whatsapp/channel/{}",

@@ -17,9 +17,10 @@ store:
 # The api0 gateway. Every tool call goes here as an MCP client, with the linked
 # person's own key — the bridge never executes a tool itself.
 #
-# NOT 5009. The gateway's config.yaml says 5009, but its pm2 definition sets
-# API0__SERVER__PORT=50054, and the env override wins. A bridge pointed at 5009
-# in production reaches nothing and every message fails at the tools/list call.
+# The gateway listens on 5009 — the port nginx proxies gateway.api0.ai to
+# (checked on the VPS with `ss -ltnp`). PM2 sets API0__SERVER__PORT=50054, but
+# that override has no effect on the gateway; 50054 reaches nothing, and every
+# message failed with "Gateway unreachable".
 gateway:
   address: "http://127.0.0.1:5009"
 

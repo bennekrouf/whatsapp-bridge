@@ -5,64 +5,125 @@ use crate::models::{ClaudeMessage, ClaudeRequest, ClaudeResponse, ClaudeTool, Co
 use graflog::app_log;
 use std::sync::Arc;
 
-const CLAUDE_API_URL: &str = "https://api.anthropic.com/v1/messages";
-/// Listing models costs nothing and still authenticates the key.
-const CLAUDE_MODELS_URL: &str = "https://api.anthropic.com/v1/models?limit=1";
+/// The built-in provider, used until the super admin chooses one in api0.
+const ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
+/// How long a provider choice is trusted before the store is asked again — so
+/// a change in the admin page takes effect within this, with no restart.
+const SETTINGS_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 const MAX_TOOL_ROUNDS: usize = 10;
 const MAX_RETRIES: u32 = 3;
 // Backoff: 1s, 2s, 4s
 const BACKOFF_BASE_MS: u64 = 1000;
 
+/// Which AI provider answers, with what key and model. Every provider here
+/// speaks Anthropic's Messages API at `{base_url}/v1/messages` — DeepSeek
+/// through its Anthropic-compatible endpoint — so one client serves them all.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LlmSettings {
+    pub provider: String,
+    pub base_url: String,
+    pub api_key: String,
+    pub model: String,
+}
+
 pub struct ClaudeClient {
-    api_key: String,
-    model: String,
+    /// The bridge's own key and model, from its configuration.
+    builtin: LlmSettings,
+    /// The super admin's choice, read from the store, and when it was read.
+    chosen: tokio::sync::RwLock<Option<(LlmSettings, std::time::Instant)>>,
+    store: crate::store_client::StoreClient,
     max_tokens: u32,
     http: reqwest::Client,
     circuit: Arc<CircuitBreaker>,
 }
 
 impl ClaudeClient {
-    pub fn new(api_key: String, model: String, max_tokens: u32) -> Self {
+    pub fn new(api_key: String, model: String, max_tokens: u32, store: crate::store_client::StoreClient) -> Self {
         Self {
-            api_key,
-            model,
+            builtin: LlmSettings {
+                provider: "claude".into(),
+                base_url: ANTHROPIC_BASE_URL.into(),
+                api_key,
+                model,
+            },
+            chosen: tokio::sync::RwLock::new(None),
+            store,
             max_tokens,
             http: reqwest::Client::new(),
             circuit: Arc::new(CircuitBreaker::new()),
         }
     }
 
-    pub fn model(&self) -> &str {
-        &self.model
+    /// The provider to use now: the super admin's choice when there is one,
+    /// re-read at most every [`SETTINGS_TTL`]; the built-in one otherwise. A
+    /// store that cannot be read keeps the last known choice.
+    pub async fn settings(&self) -> LlmSettings {
+        if let Some((s, at)) = self.chosen.read().await.as_ref() {
+            if at.elapsed() < SETTINGS_TTL {
+                return s.clone();
+            }
+        }
+        let mut slot = self.chosen.write().await;
+        let previous = slot.as_ref().map(|(s, _)| s.clone());
+        let next = match self.store.assistant_config().await {
+            Ok(Some(s)) => s,
+            Ok(None) => self.builtin.clone(),
+            Err(e) => {
+                app_log!(warn, error = %e, "Could not read the assistant's provider; keeping the last one");
+                previous.clone().unwrap_or_else(|| self.builtin.clone())
+            }
+        };
+        if previous.as_ref().is_some_and(|p| p.provider != next.provider || p.api_key != next.api_key) {
+            // A breaker opened by the old provider (say, out of credits) must
+            // not keep the new one from being tried.
+            self.circuit.record_success();
+            app_log!(info, provider = %next.provider, model = %next.model, "Assistant provider changed");
+        }
+        *slot = Some((next.clone(), std::time::Instant::now()));
+        next
     }
 
     pub fn circuit_state(&self) -> CircuitState {
         self.circuit.state()
     }
 
-    /// Whether Anthropic accepts the key, without spending a token.
+    /// Whether the current provider accepts its key, without spending a token.
     ///
     /// Deliberately outside the circuit breaker: this is how an operator finds
     /// out *why* the circuit opened, so it must not be refused by it, and a
     /// failed check must not count toward tripping it.
     pub async fn check_key(&self) -> Result<(), String> {
-        let resp = self
-            .http
-            .get(CLAUDE_MODELS_URL)
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", "2023-06-01")
+        let s = self.settings().await;
+        let req = match s.provider.as_str() {
+            // DeepSeek's balance endpoint is free and also says whether there
+            // is credit left — the failure that matters most.
+            "deepseek" => self
+                .http
+                .get("https://api.deepseek.com/user/balance")
+                .bearer_auth(&s.api_key),
+            _ => self
+                .http
+                .get(format!("{}/v1/models?limit=1", s.base_url))
+                .header("x-api-key", &s.api_key)
+                .header("anthropic-version", "2023-06-01"),
+        };
+        let resp = req
             .timeout(std::time::Duration::from_secs(5))
             .send()
             .await
-            .map_err(|e| format!("could not reach Anthropic: {}", e))?;
+            .map_err(|e| format!("could not reach {}: {}", s.provider, e))?;
 
-        if resp.status().is_success() {
-            return Ok(());
-        }
         let status = resp.status().as_u16();
         let body: serde_json::Value = resp.json().await.unwrap_or_default();
+        if (200..300).contains(&status) {
+            if s.provider == "deepseek" && body["is_available"].as_bool() == Some(false) {
+                return Err("DeepSeek answered, but the account has no balance left".into());
+            }
+            return Ok(());
+        }
         Err(format!(
-            "Anthropic answered {}: {}",
+            "{} answered {}: {}",
+            s.provider,
             status,
             body["error"]["message"].as_str().unwrap_or("no detail")
         ))
@@ -86,6 +147,8 @@ impl ClaudeClient {
         api_key: &str,
     ) -> BridgeResult<(String, Vec<ClaudeMessage>)> {
         let claude_tools: Vec<ClaudeTool> = tools.iter().map(to_claude_tool).collect();
+        // One provider for the whole turn, even if the choice changes midway.
+        let llm = self.settings().await;
 
         let mut messages = history;
         messages.push(ClaudeMessage {
@@ -95,14 +158,14 @@ impl ClaudeClient {
 
         for round in 0..MAX_TOOL_ROUNDS {
             let req = ClaudeRequest {
-                model: self.model.clone(),
+                model: llm.model.clone(),
                 max_tokens: self.max_tokens,
                 system: system_prompt.to_string(),
                 tools: claude_tools.clone(),
                 messages: messages.clone(),
             };
 
-            let resp = self.call_api_with_retry(&req).await?;
+            let resp = self.call_api_with_retry(&llm, &req).await?;
 
             match resp.stop_reason.as_str() {
                 "end_turn" => {
@@ -168,7 +231,7 @@ impl ClaudeClient {
     }
 
     /// Call Claude API with exponential backoff retry and circuit breaker.
-    async fn call_api_with_retry(&self, req: &ClaudeRequest) -> BridgeResult<ClaudeResponse> {
+    async fn call_api_with_retry(&self, llm: &LlmSettings, req: &ClaudeRequest) -> BridgeResult<ClaudeResponse> {
         // Circuit breaker check
         if !self.circuit.allow_request() {
             app_log!(warn, "Claude circuit breaker is OPEN — rejecting request");
@@ -178,7 +241,7 @@ impl ClaudeClient {
         let mut last_err = BridgeError::Other("No attempts made".into());
 
         for attempt in 0..MAX_RETRIES {
-            match self.call_api(req).await {
+            match self.call_api(llm, req).await {
                 Ok(resp) => {
                     self.circuit.record_success();
                     return Ok(resp);
@@ -221,11 +284,11 @@ impl ClaudeClient {
         Err(last_err)
     }
 
-    async fn call_api(&self, req: &ClaudeRequest) -> BridgeResult<ClaudeResponse> {
+    async fn call_api(&self, llm: &LlmSettings, req: &ClaudeRequest) -> BridgeResult<ClaudeResponse> {
         let resp = self
             .http
-            .post(CLAUDE_API_URL)
-            .header("x-api-key", &self.api_key)
+            .post(format!("{}/v1/messages", llm.base_url.trim_end_matches('/')))
+            .header("x-api-key", &llm.api_key)
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
             .json(req)

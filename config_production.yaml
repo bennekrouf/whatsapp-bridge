@@ -21,7 +21,7 @@ store:
 # API0__SERVER__PORT=50054, and the env override wins. A bridge pointed at 5009
 # in production reaches nothing and every message fails at the tools/list call.
 gateway:
-  address: "http://127.0.0.1:50054"
+  address: "http://127.0.0.1:5009"
 
 claude:
   model: "claude-sonnet-4-20250514"

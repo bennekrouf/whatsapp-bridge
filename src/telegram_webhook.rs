@@ -10,7 +10,6 @@
 // secret in `X-Telegram-Bot-Api-Secret-Token` is what proves the caller is
 // Telegram and not someone who guessed the URL.
 
-use crate::error::BridgeError;
 use crate::turn::{run_turn, Inbound};
 use crate::AppState;
 use actix_web::{web, HttpRequest, HttpResponse};
@@ -112,18 +111,11 @@ pub async fn incoming(
         Ok(r) => r,
         Err(e) => {
             app_log!(error, error = %e, "Failed to handle Telegram message");
-            let error_type = match &e {
-                BridgeError::CircuitOpen => "CircuitOpen",
-                BridgeError::ToolLoopExhausted { .. } => "ToolLoopExhausted",
-                BridgeError::Gateway(_) | BridgeError::GatewayNetwork(_) => "Gateway",
-                BridgeError::Store { .. } | BridgeError::StoreNetwork(_) => "Store",
-                _ => "Other",
-            };
             state
                 .store
-                .log_failed_message(CHANNEL, &channel.tenant_id, &external_id, &text, error_type, &e.to_string())
+                .log_failed_message(CHANNEL, &channel.tenant_id, &external_id, &text, e.kind(), &e.to_string())
                 .await;
-            "Something went wrong on my side. Please try again in a moment.".to_string()
+            e.reply().to_string()
         }
     };
 

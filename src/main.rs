@@ -82,10 +82,10 @@ async fn main() -> std::io::Result<()> {
     app_log!(info, "Config: {}", config_path);
     app_log!(info, "Store: {}", config.store.address);
     // Logged because this is the value most likely to be wrong on a deployed
-    // host: the gateway's config.yaml says 5009, but its pm2 definition sets
-    // API0__SERVER__PORT=50054 and the env override wins. Pointed at the wrong
-    // one, linking still succeeds and every tool call fails — so it has to be
-    // visible at startup rather than inferred from a failure later.
+    // host. The gateway listens on 5009 (PM2's API0__SERVER__PORT=50054 has no
+    // effect on it). Pointed at the wrong port, linking still succeeds and every
+    // tool call fails — so it has to be visible at startup rather than inferred
+    // from a failure later.
     app_log!(info, "Gateway: {}", config.gateway.address);
     app_log!(info, "Claude model: {}", config.claude.model);
 
@@ -101,6 +101,7 @@ async fn main() -> std::io::Result<()> {
             claude_api_key,
             config.claude.model.clone(),
             config.claude.max_tokens,
+            StoreClient::new(config.store.address.clone()),
         ),
         meta_app_secret,
         rate_limiter,

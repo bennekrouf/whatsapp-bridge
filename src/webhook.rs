@@ -1,4 +1,4 @@
-use crate::error::{BridgeError, BridgeResult};
+use crate::error::BridgeResult;
 use crate::models::{WaMessage, WebhookPayload};
 use crate::AppState;
 use actix_web::{web, HttpRequest, HttpResponse, Responder};
@@ -233,33 +233,27 @@ async fn process_payload(
                 {
                     app_log!(error, error = %e, "Failed to handle WA message");
 
-                    // Classify error type for the dead-letter record
-                    let error_type = match &e {
-                        BridgeError::ClaudeApi { .. } => "ClaudeApi",
-                        BridgeError::ClaudeNetwork(_) => "ClaudeNetwork",
-                        BridgeError::ClaudeParse(_) => "ClaudeParse",
-                        BridgeError::CircuitOpen => "CircuitOpen",
-                        BridgeError::ToolLoopExhausted { .. } => "ToolLoopExhausted",
-                        BridgeError::Store { .. } => "Store",
-                        BridgeError::StoreNetwork(_) => "StoreNetwork",
-                        BridgeError::GatewayNetwork(_) => "GatewayNetwork",
-                        BridgeError::Gateway(_) => "Gateway",
-                        BridgeError::WhatsAppApi { .. } => "WhatsAppApi",
-                        BridgeError::WhatsAppNetwork(_) => "WhatsAppNetwork",
-                        BridgeError::TelegramApi { .. } => "TelegramApi",
-                        BridgeError::TelegramNetwork(_) => "TelegramNetwork",
-                        BridgeError::ChannelNotFound(_) => "ChannelNotFound",
-                        BridgeError::Other(_) => "Other",
-                    };
-
                     state.store.log_failed_message(
                         CHANNEL,
                         &tenant_id,
                         &customer_phone,
                         &msg_text_preview,
-                        error_type,
+                        e.kind(),
                         &e.to_string(),
                     ).await;
+
+                    // Tell them something rather than nothing — WhatsApp used to
+                    // stay silent. Best effort: if the channel or WhatsApp itself
+                    // is what failed, there is no one to send it through.
+                    if let Ok(Some(channel)) = state.store.get_channel(&phone_number_id).await {
+                        if let Err(send_err) = state
+                            .wa
+                            .send_text(&phone_number_id, &channel.wa_token, &customer_phone, e.reply())
+                            .await
+                        {
+                            app_log!(warn, error = %send_err, "Could not send the failure reply on WhatsApp");
+                        }
+                    }
                 }
             }
         }

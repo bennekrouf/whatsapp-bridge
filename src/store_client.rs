@@ -35,6 +35,25 @@ impl StoreClient {
     }
 
     // Look up channel config by phone_number_id
+    /// A workspace's name and the reference its linking page uses
+    /// (`/link/<link_ref>`). `None` when it cannot be read — the caller then
+    /// falls back to generic instructions rather than failing the reply.
+    pub async fn link_info(&self, tenant_id: &str) -> Option<(String, String)> {
+        let resp = self
+            .client
+            .get(format!("{}/api/internal/link-info/{}", self.base_url, urlencoding::encode(tenant_id)))
+            .header("X-Internal-Secret", &self.secret)
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let body: serde_json::Value = resp.json().await.ok()?;
+        Some((body["name"].as_str()?.to_string(), body["link_ref"].as_str()?.to_string()))
+    }
+
     /// The super admin's choice of AI provider, model and key for the
     /// assistant. `Ok(None)` when none is configured — the bridge then uses its
     /// own built-in Claude key.

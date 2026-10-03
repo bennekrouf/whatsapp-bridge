@@ -37,6 +37,27 @@ const LINK_INSTRUCTIONS: &str = "This account isn't linked yet.\n\n\
 Sign in at the dashboard, open Settings → Linked messaging, and send me the \
 6-character code it shows you. After that, everything you ask here runs as you.";
 
+/// Where to send someone this bot does not know yet: the workspace's own
+/// linking page, named after it — not the api0 dashboard. Falls back to the
+/// generic text if the workspace cannot be read.
+async fn link_instructions(state: &AppState, tenant_id: &str) -> String {
+    match state.store.link_info(tenant_id).await {
+        Some((name, link_ref)) => {
+            let base = std::env::var("DASHBOARD_URL").unwrap_or_else(|_| "https://app.api0.ai".to_string());
+            linking_message(&name, &format!("{}/link/{}", base.trim_end_matches('/'), urlencoding::encode(&link_ref)))
+        }
+        None => LINK_INSTRUCTIONS.to_string(),
+    }
+}
+
+fn linking_message(workspace: &str, url: &str) -> String {
+    format!(
+        "This account isn't linked to {workspace} yet.\n\n\
+         Open {url}, sign in, and send me the 6-character code it shows — on Telegram \
+         you can just tap the button there. After that, everything you ask here runs as you."
+    )
+}
+
 /// Run one turn and return the text to send back.
 ///
 /// Rate limiting and identity are resolved here so an adapter cannot forget
@@ -86,7 +107,7 @@ pub async fn run_turn(state: &AppState, m: Inbound<'_>) -> BridgeResult<String> 
                     Err(BridgeError::Store { message, .. }) => message,
                     Err(e) => return Err(e),
                 },
-                None => LINK_INSTRUCTIONS.to_string(),
+                None => link_instructions(state, m.tenant_id).await,
             };
             return Ok(reply);
         }
@@ -122,7 +143,15 @@ pub async fn run_turn(state: &AppState, m: Inbound<'_>) -> BridgeResult<String> 
 
 #[cfg(test)]
 mod tests {
-    use super::looks_like_link_code;
+    use super::{linking_message, looks_like_link_code};
+
+    #[test]
+    fn the_linking_message_names_the_workspace_and_its_page_not_api0() {
+        let m = linking_message("Ribh", "https://app.api0.ai/link/ribh-mcp");
+        assert!(m.contains("linked to Ribh"));
+        assert!(m.contains("https://app.api0.ai/link/ribh-mcp"));
+        assert!(!m.contains("dashboard"));
+    }
 
     #[test]
     fn a_six_character_code_is_recognised_whatever_the_case_or_spacing() {

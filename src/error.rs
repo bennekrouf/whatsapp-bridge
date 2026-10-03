@@ -93,7 +93,7 @@ impl BridgeError {
         match self.kind() {
             // Only the workspace's operator can fix these.
             "ClaudeCredits" | "ClaudeAuth" | "Store" | "StoreNetwork" | "ChannelNotFound" => {
-                "The assistant is unavailable right now. The workspace owner can see why in api0. Please try again later."
+                "The assistant is unavailable right now. The team running it has been told why. Please try again later."
             }
             // Passing: a retry in a minute will likely work.
             "ClaudeOverloaded" | "ClaudeNetwork" | "CircuitOpen" | "GatewayNetwork" => {
@@ -132,7 +132,7 @@ mod tests {
     fn claude_errors_are_split_by_who_can_fix_them() {
         let credits = claude(400, r#"{"error":{"message":"Your credit balance is too low to access the Anthropic API."}}"#);
         assert_eq!(credits.kind(), "ClaudeCredits");
-        assert!(credits.reply().contains("workspace owner"));
+        assert!(credits.reply().contains("unavailable right now"));
 
         assert_eq!(claude(402, r#"{"error":{"message":"Insufficient Balance"}}"#).kind(), "ClaudeCredits");
         assert_eq!(claude(401, "invalid x-api-key").kind(), "ClaudeAuth");
@@ -146,7 +146,8 @@ mod tests {
     #[test]
     fn no_reply_leaks_the_error() {
         let e = claude(400, "Your credit balance is too low (org org_123, key sk-ant-xyz)");
-        for leak in ["credit", "org_123", "sk-ant", "Anthropic"] {
+        // Nor the platform's name: the bot is the customer's, under their brand.
+        for leak in ["credit", "org_123", "sk-ant", "Anthropic", "api0"] {
             assert!(!e.reply().contains(leak), "reply leaks {}", leak);
         }
     }

@@ -15,7 +15,26 @@ use crate::error::{BridgeError, BridgeResult};
 use graflog::app_log;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
+/// How long a key's tools and instructions are reused before the gateway is
+/// asked again — long enough that a burst of messages costs one round trip,
+/// short enough that a tool added in the dashboard shows up within it.
+const WORKSPACE_TTL: Duration = Duration::from_secs(30);
+
+/// The MCP version the bridge asks for; the gateway negotiates from it.
+const PROTOCOL_VERSION: &str = "2025-06-18";
+
+/// What a key sees of its tenant: the tools, and the tenant's `instructions`
+/// from `initialize` — how to use those tools, which the model needs as much
+/// as the tools themselves.
+#[derive(Debug, Clone)]
+pub struct Workspace {
+    pub tools: Vec<Tool>,
+    pub instructions: String,
+}
 
 /// One tool as the gateway advertises it — the shape an LLM tool definition
 /// needs, and nothing about how it is executed.
@@ -44,6 +63,8 @@ pub struct McpClient {
     endpoint: String,
     http: reqwest::Client,
     next_id: AtomicU64,
+    /// Per api key, since tools and instructions depend on whose key it is.
+    workspaces: tokio::sync::RwLock<HashMap<String, (Workspace, Instant)>>,
 }
 
 impl McpClient {
@@ -52,7 +73,52 @@ impl McpClient {
             endpoint: format!("{}/mcp", gateway_url.trim_end_matches('/')),
             http: reqwest::Client::new(),
             next_id: AtomicU64::new(1),
+            workspaces: tokio::sync::RwLock::new(HashMap::new()),
         }
+    }
+
+    /// The tools and instructions for this key, reused for [`WORKSPACE_TTL`].
+    ///
+    /// Instructions are advice: if `initialize` fails the turn goes ahead with
+    /// none, as the gateway itself does when it cannot read them. A failing
+    /// `tools/list` fails the turn, and nothing is cached.
+    pub async fn workspace(&self, api_key: &str) -> BridgeResult<Workspace> {
+        if let Some((w, at)) = self.workspaces.read().await.get(api_key) {
+            if at.elapsed() < WORKSPACE_TTL {
+                return Ok(w.clone());
+            }
+        }
+
+        let (tools, instructions) = tokio::join!(self.list_tools(api_key), self.instructions(api_key));
+        let workspace = Workspace {
+            tools: tools?,
+            instructions: instructions.unwrap_or_else(|e| {
+                app_log!(warn, error = %e, "MCP instructions unavailable, going on without them");
+                String::new()
+            }),
+        };
+
+        let mut cache = self.workspaces.write().await;
+        // Expired entries go on every write, so the map holds only keys that
+        // spoke in the last TTL.
+        cache.retain(|_, (_, at)| at.elapsed() < WORKSPACE_TTL);
+        cache.insert(api_key.to_string(), (workspace.clone(), Instant::now()));
+        Ok(workspace)
+    }
+
+    async fn instructions(&self, api_key: &str) -> BridgeResult<String> {
+        let result = self
+            .call(
+                api_key,
+                "initialize",
+                json!({
+                    "protocolVersion": PROTOCOL_VERSION,
+                    "capabilities": {},
+                    "clientInfo": { "name": "whatsapp-bridge", "version": env!("CARGO_PKG_VERSION") },
+                }),
+            )
+            .await?;
+        Ok(result["instructions"].as_str().unwrap_or_default().to_string())
     }
 
     /// Whether the configured gateway address answers as an api0 gateway.
@@ -78,7 +144,7 @@ impl McpClient {
     }
 
     /// The tools this key may use — the person's tenant, as the gateway sees it.
-    pub async fn list_tools(&self, api_key: &str) -> BridgeResult<Vec<Tool>> {
+    async fn list_tools(&self, api_key: &str) -> BridgeResult<Vec<Tool>> {
         let result = self.call(api_key, "tools/list", json!({})).await?;
         serde_json::from_value(result["tools"].clone())
             .map_err(|e| BridgeError::Gateway(format!("tools/list returned an unexpected shape: {}", e)))

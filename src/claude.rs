@@ -185,29 +185,30 @@ impl ClaudeClient {
                         content: serde_json::json!(content_blocks_to_value(&resp.content)),
                     });
 
-                    // Execute every tool_use block
-                    let mut results = vec![];
-                    for block in &resp.content {
-                        if block.block_type == "tool_use" {
-                            let tool_id = block.id.clone().unwrap_or_default();
-                            let tool_name = block.name.clone().unwrap_or_default();
-                            let input = block.input.clone().unwrap_or(serde_json::json!({}));
+                    // Execute every tool_use block at once: the model asked for
+                    // them together, so none depends on another's result, and
+                    // a turn waits for the slowest instead of the sum.
+                    // join_all keeps the order the model asked in.
+                    let calls = resp.content.iter().filter(|b| b.block_type == "tool_use").map(|block| async move {
+                        let tool_id = block.id.clone().unwrap_or_default();
+                        let tool_name = block.name.clone().unwrap_or_default();
+                        let input = block.input.clone().unwrap_or(serde_json::json!({}));
 
-                            let outcome = mcp.call_tool(api_key, &tool_name, &input).await;
+                        let outcome = mcp.call_tool(api_key, &tool_name, &input).await;
 
-                            app_log!(info, tool = %tool_name, is_error = outcome.is_error, "Tool executed via gateway");
+                        app_log!(info, tool = %tool_name, is_error = outcome.is_error, "Tool executed via gateway");
 
-                            // Claude's tool_result carries is_error too, so the
-                            // model treats a refusal as something to work around
-                            // rather than as an answer.
-                            results.push(serde_json::json!({
-                                "type":        "tool_result",
-                                "tool_use_id": tool_id,
-                                "content":     outcome.text,
-                                "is_error":    outcome.is_error,
-                            }));
-                        }
-                    }
+                        // Claude's tool_result carries is_error too, so the
+                        // model treats a refusal as something to work around
+                        // rather than as an answer.
+                        serde_json::json!({
+                            "type":        "tool_result",
+                            "tool_use_id": tool_id,
+                            "content":     outcome.text,
+                            "is_error":    outcome.is_error,
+                        })
+                    });
+                    let results = futures_util::future::join_all(calls).await;
 
                     messages.push(ClaudeMessage {
                         role: "user".into(),

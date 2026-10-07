@@ -116,17 +116,12 @@ pub async fn run_turn(state: &AppState, m: Inbound<'_>) -> BridgeResult<String> 
     app_log!(info, tenant_id = %m.tenant_id, channel = %m.channel, user = %identity.user_email, "Acting as linked person");
 
     let history = state.store.get_session(m.tenant_id, &sender_key).await?;
-    let tools = state.mcp.list_tools(&identity.api_key).await?;
-
-    let system = if m.system_prompt.trim().is_empty() {
-        "You are a helpful assistant. Use the available tools to answer the user's request."
-    } else {
-        m.system_prompt
-    };
+    let workspace = state.mcp.workspace(&identity.api_key).await?;
+    let system = system_prompt(m.system_prompt, &workspace.instructions);
 
     let (reply, updated_history) = match state
         .claude
-        .run(system, history, m.text, &tools, &state.mcp, &identity.api_key)
+        .run(&system, history, m.text, &workspace.tools, &state.mcp, &identity.api_key)
         .await
     {
         Ok(r) => r,
@@ -141,9 +136,33 @@ pub async fn run_turn(state: &AppState, m: Inbound<'_>) -> BridgeResult<String> 
     Ok(reply)
 }
 
+const DEFAULT_SYSTEM_PROMPT: &str =
+    "You are a helpful assistant. Use the available tools to answer the user's request.";
+
+/// The channel's prompt, followed by the gateway's instructions for this
+/// tenant — the same text an MCP client like Claude shows its model next to
+/// the tools, so a person on a phone gets the same guidance.
+fn system_prompt(channel_prompt: &str, instructions: &str) -> String {
+    let base = match channel_prompt.trim() {
+        "" => DEFAULT_SYSTEM_PROMPT,
+        p => p,
+    };
+    match instructions.trim() {
+        "" => base.to_string(),
+        i => format!("{base}\n\n{i}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{linking_message, looks_like_link_code};
+    use super::{linking_message, looks_like_link_code, system_prompt, DEFAULT_SYSTEM_PROMPT};
+
+    #[test]
+    fn the_gateway_instructions_follow_the_channel_prompt() {
+        assert_eq!(system_prompt("Be brief.", "List projects first."), "Be brief.\n\nList projects first.");
+        assert_eq!(system_prompt("  ", "List projects first."), format!("{DEFAULT_SYSTEM_PROMPT}\n\nList projects first."));
+        assert_eq!(system_prompt("Be brief.", " \n"), "Be brief.");
+    }
 
     #[test]
     fn the_linking_message_names_the_workspace_and_its_page_not_api0() {

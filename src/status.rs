@@ -4,8 +4,8 @@
 //
 // `/health` only proves the process answers. The failures that have actually
 // taken the bridge down are all behind that: a running binary that predates a
-// route, a Claude key that was rotated, a circuit left open after an Anthropic
-// outage, a store the bridge can no longer reach. Each is reported here on its
+// route, a provider key that was rotated or ran out of credit, a circuit left
+// open after a provider outage, a store the bridge can no longer reach. Each is reported here on its
 // own so the admin panel can say which.
 //
 // Behind the internal secret, unlike `/health`: whether webhook signatures are
@@ -40,11 +40,11 @@ pub async fn status(req: HttpRequest, state: web::Data<AppState>) -> HttpRespons
             .json(serde_json::json!({"success": false, "error": "Unauthorized"}));
     }
 
-    let (claude, store, gateway) =
-        tokio::join!(state.claude.check_key(), state.store.ping(), state.mcp.check());
-    let llm = state.claude.settings().await;
+    let (llm_key, store, gateway) =
+        tokio::join!(state.llm.check_key(), state.store.ping(), state.mcp.check());
+    let llm = state.llm.settings().await;
 
-    let circuit = match state.claude.circuit_state() {
+    let circuit = match state.llm.circuit_state() {
         CircuitState::Closed => "closed",
         CircuitState::Open => "open",
         CircuitState::HalfOpen => "half_open",
@@ -60,10 +60,12 @@ pub async fn status(req: HttpRequest, state: web::Data<AppState>) -> HttpRespons
         // What this binary serves. A bridge built before Telegram would not
         // list it — the exact failure the connector test otherwise infers from a 404.
         "channels": ["whatsapp", "telegram"],
+        // "claude" is this leg's name from before DeepSeek and Mistral; the
+        // gateway and the admin panel read it under that name.
         "claude": {
             "provider": llm.provider,
             "model": llm.model,
-            "key": leg(claude),
+            "key": leg(llm_key),
             "circuit": circuit,
         },
         "store": leg(store),

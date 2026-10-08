@@ -1,5 +1,5 @@
 use crate::error::{BridgeError, BridgeResult};
-use crate::models::{ChannelInfo, ClaudeMessage, MessagingChannel, ResolvedIdentity};
+use crate::models::{ChannelInfo, ChatMessage, MessagingChannel, ResolvedIdentity};
 use graflog::app_log;
 
 pub struct StoreClient {
@@ -56,8 +56,8 @@ impl StoreClient {
 
     /// The super admin's choice of AI provider, model and key for the
     /// assistant. `Ok(None)` when none is configured — the bridge then uses its
-    /// own built-in Claude key.
-    pub async fn assistant_config(&self) -> Result<Option<crate::claude::LlmSettings>, String> {
+    /// own built-in DeepSeek key.
+    pub async fn assistant_config(&self) -> Result<Option<crate::llm::LlmSettings>, String> {
         let resp = self
             .client
             .get(format!("{}/api/internal/assistant-config", self.base_url))
@@ -74,7 +74,7 @@ impl StoreClient {
             return Ok(None);
         }
         let field = |k: &str| body[k].as_str().map(str::to_string).ok_or_else(|| format!("missing {}", k));
-        Ok(Some(crate::claude::LlmSettings {
+        Ok(Some(crate::llm::LlmSettings {
             provider: field("provider")?,
             base_url: field("base_url")?,
             api_key: field("api_key")?,
@@ -140,7 +140,7 @@ impl StoreClient {
         &self,
         tenant_id: &str,
         customer_phone: &str,
-    ) -> BridgeResult<Vec<ClaudeMessage>> {
+    ) -> BridgeResult<Vec<ChatMessage>> {
         let url = format!(
             "{}/api/internal/whatsapp/session/{}/{}",
             self.base_url,
@@ -173,7 +173,7 @@ impl StoreClient {
         &self,
         tenant_id: &str,
         customer_phone: &str,
-        history: &[ClaudeMessage],
+        history: &[ChatMessage],
     ) -> BridgeResult<()> {
         let url = format!(
             "{}/api/internal/whatsapp/session/{}/{}",

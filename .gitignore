@@ -8,7 +8,7 @@
 
 # config_production.yaml is deliberately NOT ignored, matching the gateway and
 # store repos. It holds hosts, ports and the model name — no secrets; every
-# secret (CLAUDE_API_KEY, API0_INTERNAL_SECRET, META_APP_SECRET) is read from
+# secret (DEEPSEEK_API_KEY, API0_INTERNAL_SECRET, META_APP_SECRET) is read from
 # the environment by ecosystem.config.js. It also has to be in git for
 # deploy/update.sh to sync it onto the production host.
 

@@ -120,7 +120,7 @@ pub async fn run_turn(state: &AppState, m: Inbound<'_>) -> BridgeResult<String> 
     let system = system_prompt(m.system_prompt, &workspace.instructions);
 
     let (reply, updated_history) = match state
-        .claude
+        .llm
         .run(&system, history, m.text, &workspace.tools, &state.mcp, &identity.api_key)
         .await
     {

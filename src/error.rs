@@ -8,17 +8,17 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum BridgeError {
-    // ── Claude API errors ────────────────────────────────────────────────────
-    #[error("Claude API error (HTTP {status}): {body}")]
-    ClaudeApi { status: u16, body: String },
+    // ── AI provider (DeepSeek, Mistral) errors ───────────────────────────────
+    #[error("LLM API error (HTTP {status}): {body}")]
+    LlmApi { status: u16, body: String },
 
-    #[error("Claude API unreachable: {0}")]
-    ClaudeNetwork(#[source] reqwest::Error),
+    #[error("LLM API unreachable: {0}")]
+    LlmNetwork(#[source] reqwest::Error),
 
-    #[error("Claude response parse error: {0}")]
-    ClaudeParse(#[source] reqwest::Error),
+    #[error("LLM response parse error: {0}")]
+    LlmParse(#[source] reqwest::Error),
 
-    #[error("Claude tool loop exceeded {max_rounds} rounds")]
+    #[error("LLM tool loop exceeded {max_rounds} rounds")]
     ToolLoopExhausted { max_rounds: usize },
 
     // ── Store errors ─────────────────────────────────────────────────────────
@@ -54,7 +54,7 @@ pub enum BridgeError {
     ChannelNotFound(String),
 
     // ── Circuit breaker ────────────────────────────────────────────────────
-    #[error("Claude circuit breaker is open — service temporarily unavailable")]
+    #[error("LLM circuit breaker is open — service temporarily unavailable")]
     CircuitOpen,
 
     // ── Generic ──────────────────────────────────────────────────────────────
@@ -64,13 +64,17 @@ pub enum BridgeError {
 
 impl BridgeError {
     /// The category recorded with a failed message, and shown on the
-    /// workspace's connector status. Claude errors are split by cause: "out of
-    /// credits" and "service busy" need different people to act.
+    /// workspace's connector status. Provider errors are split by cause: "out
+    /// of credits" and "service busy" need different people to act.
+    ///
+    /// The "Claude*" names predate the switch to DeepSeek and Mistral. They are
+    /// kept: they are stored with failed messages and matched by the gateway's
+    /// connector test, and a rename would orphan both.
     pub fn kind(&self) -> &'static str {
         match self {
-            BridgeError::ClaudeApi { status, body } => claude_kind(*status, body),
-            BridgeError::ClaudeNetwork(_) => "ClaudeNetwork",
-            BridgeError::ClaudeParse(_) => "ClaudeParse",
+            BridgeError::LlmApi { status, body } => provider_kind(*status, body),
+            BridgeError::LlmNetwork(_) => "ClaudeNetwork",
+            BridgeError::LlmParse(_) => "ClaudeParse",
             BridgeError::CircuitOpen => "CircuitOpen",
             BridgeError::ToolLoopExhausted { .. } => "ToolLoopExhausted",
             BridgeError::Store { .. } => "Store",
@@ -107,13 +111,15 @@ impl BridgeError {
     }
 }
 
-/// Classify an Anthropic API error response.
-fn claude_kind(status: u16, body: &str) -> &'static str {
+/// Classify a provider's error response.
+fn provider_kind(status: u16, body: &str) -> &'static str {
     match status {
-        // Anthropic says "credit balance is too low"; DeepSeek answers 402
-        // "Insufficient Balance".
-        400 if body.to_lowercase().contains("credit balance") => "ClaudeCredits",
+        // DeepSeek answers 402 "Insufficient Balance"; Mistral may answer 400
+        // or 403 naming the exhausted credit or billing.
         402 => "ClaudeCredits",
+        400 | 403 if ["credit", "balance", "billing"].iter().any(|w| body.to_lowercase().contains(w)) => {
+            "ClaudeCredits"
+        }
         401 | 403 => "ClaudeAuth",
         429 | 503 | 529 => "ClaudeOverloaded",
         _ => "ClaudeApi",
@@ -124,30 +130,31 @@ fn claude_kind(status: u16, body: &str) -> &'static str {
 mod tests {
     use super::*;
 
-    fn claude(status: u16, body: &str) -> BridgeError {
-        BridgeError::ClaudeApi { status, body: body.to_string() }
+    fn llm(status: u16, body: &str) -> BridgeError {
+        BridgeError::LlmApi { status, body: body.to_string() }
     }
 
     #[test]
-    fn claude_errors_are_split_by_who_can_fix_them() {
-        let credits = claude(400, r#"{"error":{"message":"Your credit balance is too low to access the Anthropic API."}}"#);
+    fn provider_errors_are_split_by_who_can_fix_them() {
+        let credits = llm(400, r#"{"message":"Your credit balance is too low."}"#);
         assert_eq!(credits.kind(), "ClaudeCredits");
         assert!(credits.reply().contains("unavailable right now"));
 
-        assert_eq!(claude(402, r#"{"error":{"message":"Insufficient Balance"}}"#).kind(), "ClaudeCredits");
-        assert_eq!(claude(401, "invalid x-api-key").kind(), "ClaudeAuth");
-        assert_eq!(claude(529, "overloaded").kind(), "ClaudeOverloaded");
-        assert!(claude(529, "overloaded").reply().contains("try again in a minute"));
+        assert_eq!(llm(402, r#"{"error":{"message":"Insufficient Balance"}}"#).kind(), "ClaudeCredits");
+        assert_eq!(llm(401, "Authentication Fails").kind(), "ClaudeAuth");
+        assert_eq!(llm(403, "forbidden").kind(), "ClaudeAuth");
+        assert_eq!(llm(429, "rate limited").kind(), "ClaudeOverloaded");
+        assert!(llm(503, "overloaded").reply().contains("try again in a minute"));
 
         // A 400 for any other reason is not a billing problem.
-        assert_eq!(claude(400, "messages: field required").kind(), "ClaudeApi");
+        assert_eq!(llm(400, "messages: field required").kind(), "ClaudeApi");
     }
 
     #[test]
     fn no_reply_leaks_the_error() {
-        let e = claude(400, "Your credit balance is too low (org org_123, key sk-ant-xyz)");
+        let e = llm(400, "Your credit balance is too low (org org_123, key sk-xyz)");
         // Nor the platform's name: the bot is the customer's, under their brand.
-        for leak in ["credit", "org_123", "sk-ant", "Anthropic", "api0"] {
+        for leak in ["credit", "org_123", "sk-xyz", "DeepSeek", "Mistral", "api0"] {
             assert!(!e.reply().contains(leak), "reply leaks {}", leak);
         }
     }

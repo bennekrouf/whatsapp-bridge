@@ -1,6 +1,6 @@
 mod circuit_breaker;
-mod claude;
 mod config;
+mod llm;
 pub mod error;
 mod mcp_client;
 use mcp_client::McpClient;
@@ -15,9 +15,9 @@ mod webhook;
 mod whatsapp_api;
 
 use actix_web::{web, App, HttpResponse, HttpServer};
-use claude::ClaudeClient;
 use config::Config;
 use graflog::{app_log, init_logging, LogOption};
+use llm::LlmClient;
 use rate_limit::RateLimiter;
 use std::sync::Arc;
 use store_client::StoreClient;
@@ -29,7 +29,7 @@ pub struct AppState {
     pub mcp: McpClient,
     pub wa: WhatsAppClient,
     pub telegram: TelegramClient,
-    pub claude: ClaudeClient,
+    pub llm: LlmClient,
     pub meta_app_secret: Option<String>,
     pub rate_limiter: RateLimiter,
     pub started_at: chrono::DateTime<chrono::Utc>,
@@ -56,10 +56,12 @@ async fn main() -> std::io::Result<()> {
         std::process::exit(1);
     });
 
-    let claude_api_key = std::env::var("CLAUDE_API_KEY").unwrap_or_else(|_| {
-        eprintln!("CLAUDE_API_KEY env var required");
-        std::process::exit(1);
-    });
+    // The built-in provider's key. Optional: the provider and key chosen in
+    // Admin → Messaging assistant take over whenever one is set.
+    let deepseek_api_key = std::env::var("DEEPSEEK_API_KEY").unwrap_or_default();
+    if deepseek_api_key.trim().is_empty() {
+        app_log!(warn, "DEEPSEEK_API_KEY not set — the assistant answers only once a provider is chosen in Admin → Messaging assistant");
+    }
 
     let meta_app_secret = std::env::var("META_APP_SECRET").ok().filter(|v| !v.is_empty());
     if meta_app_secret.is_none() {
@@ -87,7 +89,7 @@ async fn main() -> std::io::Result<()> {
     // tool call fails — so it has to be visible at startup rather than inferred
     // from a failure later.
     app_log!(info, "Gateway: {}", config.gateway.address);
-    app_log!(info, "Claude model: {}", config.claude.model);
+    app_log!(info, "Built-in model: deepseek / {}", config.llm.model);
 
     let rate_limiter = RateLimiter::new();
     app_log!(info, "Rate limiter initialised");
@@ -97,10 +99,10 @@ async fn main() -> std::io::Result<()> {
         mcp: McpClient::new(&config.gateway.address),
         wa: WhatsAppClient::new(),
         telegram: TelegramClient::new(),
-        claude: ClaudeClient::new(
-            claude_api_key,
-            config.claude.model.clone(),
-            config.claude.max_tokens,
+        llm: LlmClient::new(
+            deepseek_api_key.trim().to_string(),
+            config.llm.model.clone(),
+            config.llm.max_tokens,
             StoreClient::new(config.store.address.clone()),
         ),
         meta_app_secret,
@@ -134,7 +136,7 @@ async fn main() -> std::io::Result<()> {
             .route("/health", web::get().to(|| async {
                 HttpResponse::Ok().json(serde_json::json!({"status": "ok"}))
             }))
-            // What the admin panel reads: version, and whether Claude and the
+            // What the admin panel reads: version, and whether the AI provider and the
             // store are usable from here. Internal-secret only.
             .route("/internal/status", web::get().to(status::status))
             // Meta webhook routes — one URL per tenant

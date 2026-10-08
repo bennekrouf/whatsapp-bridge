@@ -6,7 +6,9 @@ pub struct Config {
     pub server: ServerConfig,
     pub store: StoreConfig,
     pub gateway: GatewayConfig,
-    pub claude: ClaudeConfig,
+    /// The built-in AI provider's model. `claude:` is the section's old name.
+    #[serde(alias = "claude")]
+    pub llm: LlmConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -28,7 +30,7 @@ pub struct GatewayConfig {
 }
 
 #[derive(Debug, Deserialize, Clone)]
-pub struct ClaudeConfig {
+pub struct LlmConfig {
     pub model: String,
     pub max_tokens: u32,
 }

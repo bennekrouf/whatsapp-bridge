@@ -24,7 +24,7 @@ Both are version-controlled here:
 - `deploy/whatsapp-bridge.env.example` — the shape of the env file. The real
   `/opt/api0/whatsapp-bridge.env` holds secrets and is not in git.
 
-`whatsapp-bridge.env` holds `CLAUDE_API_KEY`, `API0_INTERNAL_SECRET`, optionally
+`whatsapp-bridge.env` holds `DEEPSEEK_API_KEY`, `API0_INTERNAL_SECRET`, optionally
 `META_APP_SECRET`, plus `LOG_PATH_API0` and `CONFIG_PATH`.
 
 WhatsApp webhooks are checked against the tenant's own App Secret (saved with
@@ -75,7 +75,7 @@ file open, and `mv` swaps the directory entry atomically.
 
 Restart with a plain `pm2 restart`. Never `--update-env` — the process env comes
 from the wrapper's env file, and `--update-env` replaces it with the invoking
-shell's, which will not have `CLAUDE_API_KEY`.
+shell's, which will not have `API0_INTERNAL_SECRET`.
 
 ## Verifying
 

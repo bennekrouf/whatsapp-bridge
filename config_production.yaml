@@ -24,6 +24,8 @@ store:
 gateway:
   address: "http://127.0.0.1:5009"
 
-claude:
-  model: "claude-sonnet-4-20250514"
+# The built-in AI provider (DeepSeek, key in DEEPSEEK_API_KEY). The provider
+# chosen in Admin → Messaging assistant (DeepSeek or Mistral) overrides it.
+llm:
+  model: "deepseek-chat"
   max_tokens: 1024

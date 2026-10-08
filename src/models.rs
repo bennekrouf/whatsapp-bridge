@@ -61,49 +61,99 @@ pub struct ChannelInfo {
 
 #[derive(Debug, Deserialize)]
 pub struct SessionResponse {
-    pub history: Vec<ClaudeMessage>,
+    pub history: Vec<ChatMessage>,
 }
 
-// ── Claude API ────────────────────────────────────────────────────────────────
+// ── Chat completions (DeepSeek, Mistral) ──────────────────────────────────────
+
+/// One message of a conversation, in the OpenAI-style chat-completions shape
+/// both providers speak. `content` is a Value because a history saved before
+/// the switch away from Anthropic holds arrays of content blocks there — see
+/// `llm::normalize_history`.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ChatMessage {
+    pub role: String,
+    #[serde(default)]
+    pub content: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    /// The tool's name on a `tool` message; Mistral expects it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// DeepSeek's thinking output. Sent back within a turn's tool rounds,
+    /// stripped before the history is saved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
+}
+
+impl ChatMessage {
+    pub fn text(role: &str, content: impl Into<String>) -> Self {
+        Self {
+            role: role.into(),
+            content: serde_json::Value::String(content.into()),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+            reasoning_content: None,
+        }
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct ClaudeMessage {
-    pub role: String,
-    pub content: serde_json::Value,
+pub struct ToolCall {
+    pub id: String,
+    #[serde(rename = "type", default = "function_type")]
+    pub call_type: String,
+    pub function: FunctionCall,
+}
+
+fn function_type() -> String {
+    "function".into()
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct FunctionCall {
+    pub name: String,
+    /// JSON-encoded arguments, as a string.
+    #[serde(default)]
+    pub arguments: String,
 }
 
 #[derive(Debug, Serialize)]
-pub struct ClaudeRequest {
+pub struct ChatRequest {
     pub model: String,
     pub max_tokens: u32,
-    pub system: String,
-    pub tools: Vec<ClaudeTool>,
-    pub messages: Vec<ClaudeMessage>,
+    pub messages: Vec<ChatMessage>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<ChatTool>,
 }
 
 #[derive(Debug, Serialize, Clone)]
-pub struct ClaudeTool {
+pub struct ChatTool {
+    #[serde(rename = "type")]
+    pub tool_type: &'static str,
+    pub function: ChatFunction,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct ChatFunction {
     pub name: String,
     pub description: String,
-    pub input_schema: serde_json::Value,
+    pub parameters: serde_json::Value,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct ClaudeResponse {
-    pub stop_reason: String,
-    pub content: Vec<ContentBlock>,
+pub struct ChatResponse {
+    pub choices: Vec<ChatChoice>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct ContentBlock {
-    #[serde(rename = "type")]
-    pub block_type: String,
-    // text block
-    pub text: Option<String>,
-    // tool_use block
-    pub id: Option<String>,
-    pub name: Option<String>,
-    pub input: Option<serde_json::Value>,
+#[derive(Debug, Deserialize)]
+pub struct ChatChoice {
+    pub message: ChatMessage,
+    #[serde(default)]
+    pub finish_reason: Option<String>,
 }
 
 // ── Identity ──────────────────────────────────────────────────────────────────

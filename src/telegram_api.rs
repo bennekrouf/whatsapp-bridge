@@ -20,7 +20,7 @@ impl TelegramClient {
     }
 
     pub async fn send_text(&self, bot_token: &str, chat_id: i64, text: &str) -> BridgeResult<()> {
-        for chunk in split_message(text) {
+        for chunk in split_message(text, MAX_MESSAGE_CHARS) {
             let url = format!("https://api.telegram.org/bot{}/sendMessage", bot_token);
             let resp = self
                 .http
@@ -41,22 +41,24 @@ impl TelegramClient {
     }
 }
 
-fn split_message(text: &str) -> Vec<String> {
-    if text.chars().count() <= MAX_MESSAGE_CHARS {
+/// Split a reply into messages of at most `max` characters, on paragraph
+/// boundaries where possible. Shared by every channel with a size cap.
+pub fn split_message(text: &str, max: usize) -> Vec<String> {
+    if text.chars().count() <= max {
         return vec![text.to_string()];
     }
     let mut out = Vec::new();
     let mut current = String::new();
     for para in text.split("\n\n") {
         let candidate_len = current.chars().count() + para.chars().count() + 2;
-        if candidate_len > MAX_MESSAGE_CHARS && !current.is_empty() {
+        if candidate_len > max && !current.is_empty() {
             out.push(std::mem::take(&mut current));
         }
         if !current.is_empty() {
             current.push_str("\n\n");
         }
         // A single paragraph longer than the cap is cut hard; rare enough.
-        current.extend(para.chars().take(MAX_MESSAGE_CHARS));
+        current.extend(para.chars().take(max));
     }
     if !current.is_empty() {
         out.push(current);
@@ -70,14 +72,14 @@ mod tests {
 
     #[test]
     fn short_messages_are_sent_whole() {
-        assert_eq!(split_message("hello"), vec!["hello".to_string()]);
+        assert_eq!(split_message("hello", MAX_MESSAGE_CHARS), vec!["hello".to_string()]);
     }
 
     #[test]
     fn long_messages_split_on_paragraphs_under_the_cap() {
         let para = "x".repeat(3000);
         let text = format!("{para}\n\n{para}");
-        let parts = split_message(&text);
+        let parts = split_message(&text, MAX_MESSAGE_CHARS);
         assert_eq!(parts.len(), 2);
         assert!(parts.iter().all(|p| p.chars().count() <= MAX_MESSAGE_CHARS));
     }

@@ -1,7 +1,8 @@
 # Deploying the bridge
 
-This service serves two doors from one binary: the WhatsApp webhook
-(`/webhook/{tenant_id}`) and the Telegram webhook (`/telegram/webhook/{bot_id}`).
+This service serves three doors from one binary: the WhatsApp webhook
+(`/webhook/{tenant_id}`), the Telegram webhook (`/telegram/webhook/{bot_id}`)
+and the Teams webhook (`/teams/webhook/{app_id}`).
 
 ## How it starts in production
 
@@ -88,3 +89,14 @@ curl -s -o /dev/null -w '%{http_code}\n' \
 `200` means the Telegram route is live (bot `0` is unknown, and the handler
 answers 200 to everything so Telegram does not retry forever). `404` means the
 running binary predates Telegram support — the copy step above was missed.
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' \
+  -X POST https://wa-bridge.api0.ai/teams/webhook/0 \
+  -H 'Content-Type: application/json' -d '{}'
+```
+
+`400` means the Teams route is live (`{}` is not an activity, so it is refused
+before anything else). `404` means the running binary predates Teams support.
+The bridge fetches Microsoft's signing keys from `login.botframework.com` and
+tokens from `login.microsoftonline.com`, so both must be reachable from the host.

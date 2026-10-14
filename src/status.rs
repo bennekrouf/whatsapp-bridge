@@ -59,7 +59,7 @@ pub async fn status(req: HttpRequest, state: web::Data<AppState>) -> HttpRespons
         "uptime_seconds": (now - state.started_at).num_seconds(),
         // What this binary serves. A bridge built before Telegram would not
         // list it — the exact failure the connector test otherwise infers from a 404.
-        "channels": ["whatsapp", "telegram"],
+        "channels": ["whatsapp", "telegram", "teams"],
         // "claude" is this leg's name from before DeepSeek and Mistral; the
         // gateway and the admin panel read it under that name.
         "claude": {

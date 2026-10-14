@@ -22,8 +22,9 @@ pub struct Change {
 #[derive(Debug, Deserialize)]
 pub struct ChangeValue {
     pub metadata: Metadata,
+    // Delivery receipts (`statuses`) arrive here too; with no field for them,
+    // serde skips them.
     pub messages: Option<Vec<WaMessage>>,
-    pub statuses: Option<Vec<serde_json::Value>>, // delivery receipts — ignored
 }
 
 #[derive(Debug, Deserialize)]
@@ -57,11 +58,6 @@ pub struct ChannelInfo {
     /// predates it, hence the default.
     #[serde(default)]
     pub app_secret: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct SessionResponse {
-    pub history: Vec<ChatMessage>,
 }
 
 // ── Chat completions (DeepSeek, Mistral) ──────────────────────────────────────

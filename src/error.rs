@@ -126,6 +126,23 @@ fn provider_kind(status: u16, body: &str) -> &'static str {
     }
 }
 
+// Allow `?` on reqwest::Error where we want a generic network bucket
+impl From<reqwest::Error> for BridgeError {
+    fn from(e: reqwest::Error) -> Self {
+        BridgeError::Other(e.to_string())
+    }
+}
+
+// Allow `?` on serde_json::Error
+impl From<serde_json::Error> for BridgeError {
+    fn from(e: serde_json::Error) -> Self {
+        BridgeError::Other(e.to_string())
+    }
+}
+
+/// Convenience type alias
+pub type BridgeResult<T> = Result<T, BridgeError>;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -159,20 +176,3 @@ mod tests {
         }
     }
 }
-
-// Allow `?` on reqwest::Error where we want a generic network bucket
-impl From<reqwest::Error> for BridgeError {
-    fn from(e: reqwest::Error) -> Self {
-        BridgeError::Other(e.to_string())
-    }
-}
-
-// Allow `?` on serde_json::Error
-impl From<serde_json::Error> for BridgeError {
-    fn from(e: serde_json::Error) -> Self {
-        BridgeError::Other(e.to_string())
-    }
-}
-
-/// Convenience type alias
-pub type BridgeResult<T> = Result<T, BridgeError>;

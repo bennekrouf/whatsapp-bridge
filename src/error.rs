@@ -49,6 +49,17 @@ pub enum BridgeError {
     #[error("Telegram API unreachable: {0}")]
     TelegramNetwork(#[source] reqwest::Error),
 
+    // ── Microsoft Teams errors ───────────────────────────────────────────────
+    #[error("Teams API error (HTTP {status}): {body}")]
+    TeamsApi { status: u16, body: String },
+
+    #[error("Teams API unreachable: {0}")]
+    TeamsNetwork(#[source] reqwest::Error),
+
+    /// Microsoft refused the bot's App ID and secret — only the operator can fix it.
+    #[error("Teams token refused (HTTP {status}): {body}")]
+    TeamsAuth { status: u16, body: String },
+
     // ── Channel / config errors ──────────────────────────────────────────────
     #[error("No channel config found for phone_number_id={0}")]
     ChannelNotFound(String),
@@ -85,6 +96,9 @@ impl BridgeError {
             BridgeError::WhatsAppNetwork(_) => "WhatsAppNetwork",
             BridgeError::TelegramApi { .. } => "TelegramApi",
             BridgeError::TelegramNetwork(_) => "TelegramNetwork",
+            BridgeError::TeamsApi { .. } => "TeamsApi",
+            BridgeError::TeamsNetwork(_) => "TeamsNetwork",
+            BridgeError::TeamsAuth { .. } => "TeamsAuth",
             BridgeError::ChannelNotFound(_) => "ChannelNotFound",
             BridgeError::Other(_) => "Other",
         }
@@ -96,7 +110,7 @@ impl BridgeError {
     pub fn reply(&self) -> &'static str {
         match self.kind() {
             // Only the workspace's operator can fix these.
-            "ClaudeCredits" | "ClaudeAuth" | "Store" | "StoreNetwork" | "ChannelNotFound" => {
+            "ClaudeCredits" | "ClaudeAuth" | "Store" | "StoreNetwork" | "ChannelNotFound" | "TeamsAuth" => {
                 "The assistant is unavailable right now. The team running it has been told why. Please try again later."
             }
             // Passing: a retry in a minute will likely work.

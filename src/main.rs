@@ -8,6 +8,9 @@ mod models;
 mod rate_limit;
 mod status;
 mod store_client;
+mod teams_api;
+mod teams_auth;
+mod teams_webhook;
 mod telegram_api;
 mod telegram_webhook;
 mod turn;
@@ -23,12 +26,16 @@ use std::sync::Arc;
 use store_client::StoreClient;
 use whatsapp_api::WhatsAppClient;
 use telegram_api::TelegramClient;
+use teams_api::TeamsClient;
+use teams_auth::TeamsAuth;
 
 pub struct AppState {
     pub store: StoreClient,
     pub mcp: McpClient,
     pub wa: WhatsAppClient,
     pub telegram: TelegramClient,
+    pub teams: TeamsClient,
+    pub teams_auth: TeamsAuth,
     pub llm: LlmClient,
     pub meta_app_secret: Option<String>,
     pub rate_limiter: RateLimiter,
@@ -99,6 +106,8 @@ async fn main() -> std::io::Result<()> {
         mcp: McpClient::new(&config.gateway.address),
         wa: WhatsAppClient::new(),
         telegram: TelegramClient::new(),
+        teams: TeamsClient::new(),
+        teams_auth: TeamsAuth::new(),
         llm: LlmClient::new(
             deepseek_api_key.trim().to_string(),
             config.llm.model.clone(),
@@ -144,6 +153,8 @@ async fn main() -> std::io::Result<()> {
             .route("/webhook/{tenant_id}", web::post().to(webhook::incoming))
             // Telegram delivers every update here; the bot id routes to a tenant.
             .route("/telegram/webhook/{bot_id}", web::post().to(telegram_webhook::incoming))
+            // Teams delivers every activity here, signed; the App ID routes to a tenant.
+            .route("/teams/webhook/{app_id}", web::post().to(teams_webhook::incoming))
     })
     .bind(&addr)?
     .run()

@@ -1,5 +1,5 @@
 use crate::error::{BridgeError, BridgeResult};
-use crate::models::{ChannelInfo, ChatMessage, MessagingChannel, ResolvedIdentity};
+use crate::models::{ChannelInfo, ChatMessage, MessagingChannel, ResolvedIdentity, TurnUsage};
 use graflog::app_log;
 
 pub struct StoreClient {
@@ -284,6 +284,7 @@ impl StoreClient {
                 Ok(Some(ResolvedIdentity {
                     user_email: body["user_email"].as_str().unwrap_or_default().to_string(),
                     api_key: body["api_key"].as_str().unwrap_or_default().to_string(),
+                    api_key_id: body["api_key_id"].as_str().unwrap_or_default().to_string(),
                 }))
             }
             404 => Ok(None),
@@ -359,6 +360,38 @@ impl StoreClient {
         }
     }
 
+    /// Put a turn's tokens on the usage ledger, against the linked person's key
+    /// and the tenant whose bot answered — the store deducts the credits.
+    /// Best effort with a short timeout: a failure here must never cost the
+    /// person their reply.
+    pub async fn log_usage(
+        &self,
+        channel: &str,
+        tenant_id: &str,
+        identity: &ResolvedIdentity,
+        usage: &TurnUsage,
+        response_time_ms: i64,
+        failed: bool,
+    ) {
+        if usage.calls == 0 {
+            return;
+        }
+        let url = format!("{}/api/user/usage/log", self.base_url);
+        let result = self
+            .client
+            .post(&url)
+            .header("X-Internal-Secret", &self.secret)
+            .timeout(std::time::Duration::from_secs(2))
+            .json(&usage_log_body(channel, tenant_id, identity, usage, response_time_ms, failed))
+            .send()
+            .await;
+        match result {
+            Ok(resp) if resp.status().is_success() => {}
+            Ok(resp) => app_log!(warn, status = %resp.status(), tokens = usage.total_tokens, "Could not log assistant usage"),
+            Err(e) => app_log!(warn, error = %e, tokens = usage.total_tokens, "Could not log assistant usage (network)"),
+        }
+    }
+
     /// Log a failed message to the dead-letter queue.
     /// Fire-and-forget: errors are logged but not propagated.
     pub async fn log_failed_message(
@@ -396,5 +429,60 @@ impl StoreClient {
                 app_log!(warn, error = %e, "Failed to log dead letter to store (network)");
             }
         }
+    }
+}
+
+fn usage_log_body(
+    channel: &str,
+    tenant_id: &str,
+    identity: &ResolvedIdentity,
+    usage: &TurnUsage,
+    response_time_ms: i64,
+    failed: bool,
+) -> serde_json::Value {
+    serde_json::json!({
+        "key_id": identity.api_key_id,
+        "email": identity.user_email,
+        "endpoint_path": format!("assistant/{}", channel),
+        "method": "LLM",
+        "status_code": if failed { 500 } else { 200 },
+        "response_time_ms": response_time_ms,
+        "tenant_id": tenant_id,
+        "usage": {
+            "estimated": false,
+            "input_tokens": usage.input_tokens,
+            "output_tokens": usage.output_tokens,
+            "total_tokens": usage.total_tokens,
+            "model": usage.model,
+        },
+        "metadata": {
+            "channel": channel,
+            "provider": usage.provider,
+            "llm_calls": usage.calls,
+        },
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_turn_is_logged_against_the_linked_key_and_the_bots_tenant() {
+        let id = ResolvedIdentity { user_email: "a@b.c".into(), api_key: "secret".into(), api_key_id: "key-1".into() };
+        let usage = TurnUsage {
+            provider: "deepseek".into(),
+            model: "deepseek-chat".into(),
+            calls: 2,
+            input_tokens: 900,
+            output_tokens: 100,
+            total_tokens: 1000,
+        };
+        let v = usage_log_body("teams", "t-1", &id, &usage, 1234, false);
+        assert_eq!(v["key_id"], "key-1");
+        assert_eq!(v["tenant_id"], "t-1");
+        assert_eq!(v["usage"]["total_tokens"], 1000);
+        assert_eq!(v["endpoint_path"], "assistant/teams");
+        assert!(!v.to_string().contains("secret"), "the key itself must never be logged");
     }
 }

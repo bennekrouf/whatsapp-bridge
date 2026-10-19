@@ -143,6 +143,43 @@ pub struct ChatFunction {
 #[derive(Debug, Deserialize)]
 pub struct ChatResponse {
     pub choices: Vec<ChatChoice>,
+    /// What the call cost. Every OpenAI-style provider sends it; a missing one
+    /// counts as nothing rather than failing the reply.
+    #[serde(default)]
+    pub usage: Option<ChatUsage>,
+}
+
+#[derive(Debug, Deserialize, Default, Clone, Copy)]
+pub struct ChatUsage {
+    #[serde(default)]
+    pub prompt_tokens: i64,
+    #[serde(default)]
+    pub completion_tokens: i64,
+    #[serde(default)]
+    pub total_tokens: i64,
+}
+
+/// Tokens spent on one turn, across every round of tool calls — what is billed
+/// to the person the turn ran as.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct TurnUsage {
+    pub provider: String,
+    pub model: String,
+    /// How many completions the turn took.
+    pub calls: u32,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub total_tokens: i64,
+}
+
+impl TurnUsage {
+    pub fn add(&mut self, u: &ChatUsage) {
+        self.calls += 1;
+        self.input_tokens += u.prompt_tokens;
+        self.output_tokens += u.completion_tokens;
+        // Some providers leave the total out; it is never less than the parts.
+        self.total_tokens += u.total_tokens.max(u.prompt_tokens + u.completion_tokens);
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -160,6 +197,8 @@ pub struct ResolvedIdentity {
     pub user_email: String,
     /// Their own api0 key, pinned to this tenant. Used for every tool call.
     pub api_key: String,
+    /// That key's id — what the usage ledger records the turn against.
+    pub api_key_id: String,
 }
 
 /// A tenant's bot on a messaging platform, as the bridge needs it.

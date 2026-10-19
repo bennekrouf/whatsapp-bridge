@@ -1,7 +1,7 @@
 use crate::circuit_breaker::{CircuitBreaker, CircuitState};
 use crate::error::{BridgeError, BridgeResult};
 use crate::mcp_client::{McpClient, Tool};
-use crate::models::{ChatFunction, ChatMessage, ChatRequest, ChatResponse, ChatTool};
+use crate::models::{ChatFunction, ChatMessage, ChatRequest, ChatResponse, ChatTool, TurnUsage};
 use graflog::app_log;
 use std::sync::Arc;
 
@@ -155,6 +155,10 @@ impl LlmClient {
     /// Every tool call goes to the gateway with `api_key` — the linked person's
     /// own key — so it runs with their credentials and is attributed to them.
     /// This function knows nothing about how a tool is executed, and must not.
+    ///
+    /// Tokens are added to `usage` as each completion returns, so a turn that
+    /// fails after some rounds still accounts for what it spent.
+    #[allow(clippy::too_many_arguments)]
     pub async fn run(
         &self,
         system_prompt: &str,
@@ -163,10 +167,13 @@ impl LlmClient {
         tools: &[Tool],
         mcp: &McpClient,
         api_key: &str,
+        usage: &mut TurnUsage,
     ) -> BridgeResult<(String, Vec<ChatMessage>)> {
         let chat_tools: Vec<ChatTool> = tools.iter().map(to_chat_tool).collect();
         // One provider for the whole turn, even if the choice changes midway.
         let llm = self.settings().await;
+        usage.provider = llm.provider.clone();
+        usage.model = llm.model.clone();
 
         let mut messages = normalize_history(history);
         messages.push(ChatMessage::text("user", user_message));
@@ -185,6 +192,13 @@ impl LlmClient {
             };
 
             let resp = self.call_api_with_retry(&llm, &req).await?;
+            match &resp.usage {
+                Some(u) => usage.add(u),
+                None => {
+                    app_log!(warn, provider = %llm.provider, "Completion came back without token usage");
+                    usage.calls += 1;
+                }
+            }
             let Some(choice) = resp.choices.into_iter().next() else {
                 return Err(BridgeError::Other(format!("{} answered with no choices", llm.provider)));
             };
@@ -500,6 +514,22 @@ mod tests {
         assert_eq!(v["tools"][0]["type"], "function");
         assert_eq!(v["tools"][0]["function"]["parameters"]["type"], "object");
         assert!(v["messages"][0].get("tool_calls").is_none());
+    }
+
+    #[test]
+    fn token_usage_adds_up_across_rounds_and_may_be_missing() {
+        let with: ChatResponse = serde_json::from_value(serde_json::json!({
+            "choices": [],
+            "usage": { "prompt_tokens": 120, "completion_tokens": 30 }
+        }))
+        .unwrap();
+        let without: ChatResponse = serde_json::from_value(serde_json::json!({ "choices": [] })).unwrap();
+        assert!(without.usage.is_none());
+
+        let mut turn = TurnUsage::default();
+        turn.add(with.usage.as_ref().unwrap());
+        turn.add(&crate::models::ChatUsage { prompt_tokens: 200, completion_tokens: 10, total_tokens: 210 });
+        assert_eq!((turn.calls, turn.input_tokens, turn.output_tokens, turn.total_tokens), (2, 320, 40, 360));
     }
 
     #[test]

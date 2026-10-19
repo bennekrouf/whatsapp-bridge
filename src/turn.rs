@@ -119,11 +119,20 @@ pub async fn run_turn(state: &AppState, m: Inbound<'_>) -> BridgeResult<String> 
     let workspace = state.mcp.workspace(&identity.api_key).await?;
     let system = system_prompt(m.system_prompt, &workspace.instructions);
 
-    let (reply, updated_history) = match state
+    let mut usage = crate::models::TurnUsage::default();
+    let started = std::time::Instant::now();
+    let outcome = state
         .llm
-        .run(&system, history, m.text, &workspace.tools, &state.mcp, &identity.api_key)
-        .await
-    {
+        .run(&system, history, m.text, &workspace.tools, &state.mcp, &identity.api_key, &mut usage)
+        .await;
+    // Whatever the outcome, the tokens were spent: they go on the ledger and
+    // come off the person's credits before anything else can fail.
+    state
+        .store
+        .log_usage(m.channel, m.tenant_id, &identity, &usage, started.elapsed().as_millis() as i64, outcome.is_err())
+        .await;
+
+    let (reply, updated_history) = match outcome {
         Ok(r) => r,
         Err(BridgeError::CircuitOpen) => {
             app_log!(warn, tenant_id = %m.tenant_id, "Circuit open");

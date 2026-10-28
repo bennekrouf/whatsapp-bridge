@@ -123,7 +123,7 @@ pub async fn run_turn(state: &AppState, m: Inbound<'_>) -> BridgeResult<String> 
     let started = std::time::Instant::now();
     let outcome = state
         .llm
-        .run(&system, history, m.text, &workspace.tools, &state.mcp, &identity.api_key, &mut usage)
+        .run(&system, history, m.text, &workspace.tools, &state.mcp, &identity.api_key, m.tenant_id, &mut usage)
         .await;
     // Whatever the outcome, the tokens were spent: they go on the ledger and
     // come off the person's credits before anything else can fail.

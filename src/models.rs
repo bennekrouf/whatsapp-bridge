@@ -165,6 +165,8 @@ pub struct ChatUsage {
 pub struct TurnUsage {
     pub provider: String,
     pub model: String,
+    /// The region the workspace chose, when the turn ran on one.
+    pub region: Option<String>,
     /// How many completions the turn took.
     pub calls: u32,
     pub input_tokens: i64,

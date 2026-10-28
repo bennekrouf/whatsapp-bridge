@@ -54,13 +54,18 @@ impl StoreClient {
         Some((body["name"].as_str()?.to_string(), body["link_ref"].as_str()?.to_string()))
     }
 
-    /// The super admin's choice of AI provider, model and key for the
-    /// assistant. `Ok(None)` when none is configured — the bridge then uses its
-    /// own built-in DeepSeek key.
-    pub async fn assistant_config(&self) -> Result<Option<crate::llm::LlmSettings>, String> {
+    /// The AI provider, model and key the assistant answers with: for
+    /// `tenant_id`, its region's when the workspace chose one, else the super
+    /// admin's choice. `Ok(None)` when neither is configured — the bridge then
+    /// uses its own built-in DeepSeek key.
+    pub async fn assistant_config(&self, tenant_id: Option<&str>) -> Result<Option<crate::llm::LlmSettings>, String> {
+        let mut url = format!("{}/api/internal/assistant-config", self.base_url);
+        if let Some(t) = tenant_id {
+            url.push_str(&format!("?tenant_id={}", urlencoding::encode(t)));
+        }
         let resp = self
             .client
-            .get(format!("{}/api/internal/assistant-config", self.base_url))
+            .get(url)
             .header("X-Internal-Secret", &self.secret)
             .timeout(std::time::Duration::from_secs(5))
             .send()
@@ -77,8 +82,12 @@ impl StoreClient {
         Ok(Some(crate::llm::LlmSettings {
             provider: field("provider")?,
             base_url: field("base_url")?,
+            // A store from before regions sends none: every provider it could
+            // choose answered here.
+            chat_path: field("chat_path").unwrap_or_else(|_| "/v1/chat/completions".into()),
             api_key: field("api_key")?,
             model: field("model")?,
+            region: field("region").ok(),
         }))
     }
 
@@ -458,6 +467,7 @@ fn usage_log_body(
         "metadata": {
             "channel": channel,
             "provider": usage.provider,
+            "region": usage.region,
             "llm_calls": usage.calls,
         },
     })
@@ -473,6 +483,7 @@ mod tests {
         let usage = TurnUsage {
             provider: "deepseek".into(),
             model: "deepseek-chat".into(),
+            region: Some("china".into()),
             calls: 2,
             input_tokens: 900,
             output_tokens: 100,
@@ -483,6 +494,7 @@ mod tests {
         assert_eq!(v["tenant_id"], "t-1");
         assert_eq!(v["usage"]["total_tokens"], 1000);
         assert_eq!(v["endpoint_path"], "assistant/teams");
+        assert_eq!(v["metadata"]["region"], "china");
         assert!(!v.to_string().contains("secret"), "the key itself must never be logged");
     }
 }

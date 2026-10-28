@@ -7,8 +7,11 @@ use std::sync::Arc;
 
 /// The built-in provider, used until the super admin chooses one in api0.
 const DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com";
+/// Where most providers answer chat completions, after their base URL.
+const CHAT_PATH: &str = "/v1/chat/completions";
 /// How long a provider choice is trusted before the store is asked again — so
-/// a change in the admin page takes effect within this, with no restart.
+/// a change in the admin page, or a workspace's region, takes effect within
+/// this, with no restart.
 const SETTINGS_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 const MAX_TOOL_ROUNDS: usize = 10;
 const MAX_RETRIES: u32 = 3;
@@ -16,15 +19,18 @@ const MAX_RETRIES: u32 = 3;
 const BACKOFF_BASE_MS: u64 = 1000;
 
 /// Which AI provider answers, with what key and model. Every provider here
-/// (DeepSeek, Mistral) speaks the OpenAI-style chat-completions API at
-/// `{base_url}/v1/chat/completions`, tool calls included — so one client
-/// serves them all.
+/// speaks the OpenAI-style chat-completions API, tool calls included, at
+/// `{base_url}{chat_path}` — so one client serves them all.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LlmSettings {
     pub provider: String,
     pub base_url: String,
+    /// `/v1/chat/completions` for most; Gemini, Qwen and GLM have their own.
+    pub chat_path: String,
     pub api_key: String,
     pub model: String,
+    /// The region the workspace chose, when it runs on one.
+    pub region: Option<String>,
 }
 
 impl LlmSettings {
@@ -34,17 +40,29 @@ impl LlmSettings {
         let base = self.base_url.trim_end_matches('/').trim_end_matches("/anthropic");
         format!("{}{}", base, path)
     }
+
+    fn chat_url(&self) -> String {
+        self.endpoint(&self.chat_path)
+    }
 }
+
+/// The settings cache's key for the platform's provider, which is also what
+/// a workspace without a region of its own answers with.
+const PLATFORM: &str = "";
 
 pub struct LlmClient {
     /// The bridge's own key and model, from its configuration.
     builtin: LlmSettings,
-    /// The super admin's choice, read from the store, and when it was read.
-    chosen: tokio::sync::RwLock<Option<(LlmSettings, std::time::Instant)>>,
+    /// What the store says each workspace (and the platform, under
+    /// [`PLATFORM`]) answers with, and when it was read.
+    chosen: tokio::sync::RwLock<std::collections::HashMap<String, (LlmSettings, std::time::Instant)>>,
     store: crate::store_client::StoreClient,
     max_tokens: u32,
     http: reqwest::Client,
-    circuit: Arc<CircuitBreaker>,
+    /// One per provider: workspaces on different regions run on different
+    /// providers, and one that is down (say, out of credits) must not stop the
+    /// others.
+    circuits: std::sync::Mutex<std::collections::HashMap<String, Arc<CircuitBreaker>>>,
 }
 
 impl LlmClient {
@@ -55,57 +73,64 @@ impl LlmClient {
             builtin: LlmSettings {
                 provider: "deepseek".into(),
                 base_url: DEEPSEEK_BASE_URL.into(),
+                chat_path: CHAT_PATH.into(),
                 api_key,
                 model,
+                region: None,
             },
-            chosen: tokio::sync::RwLock::new(None),
+            chosen: tokio::sync::RwLock::new(std::collections::HashMap::new()),
             store,
             max_tokens,
             http: reqwest::Client::new(),
-            circuit: Arc::new(CircuitBreaker::new()),
+            circuits: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
-    /// The provider to use now: the super admin's choice when there is one,
-    /// re-read at most every [`SETTINGS_TTL`]; the built-in one otherwise. A
-    /// store that cannot be read keeps the last known choice.
-    pub async fn settings(&self) -> LlmSettings {
-        if let Some((s, at)) = self.chosen.read().await.as_ref() {
+    /// The provider `tenant_id`'s assistant answers with now — its region's
+    /// when it chose one, else the super admin's choice, else the built-in
+    /// one; `None` for the platform's. Re-read at most every [`SETTINGS_TTL`];
+    /// a store that cannot be read keeps the last known one.
+    pub async fn settings(&self, tenant_id: Option<&str>) -> LlmSettings {
+        let key = tenant_id.unwrap_or(PLATFORM);
+        if let Some((s, at)) = self.chosen.read().await.get(key) {
             if at.elapsed() < SETTINGS_TTL {
                 return s.clone();
             }
         }
-        let mut slot = self.chosen.write().await;
-        let previous = slot.as_ref().map(|(s, _)| s.clone());
-        let next = match self.store.assistant_config().await {
+        let mut cache = self.chosen.write().await;
+        let previous = cache.get(key).map(|(s, _)| s.clone());
+        let next = match self.store.assistant_config(tenant_id).await {
             Ok(Some(s)) => s,
             Ok(None) => self.builtin.clone(),
             Err(e) => {
-                app_log!(warn, error = %e, "Could not read the assistant's provider; keeping the last one");
+                app_log!(warn, error = %e, tenant_id = %key, "Could not read the assistant's provider; keeping the last one");
                 previous.clone().unwrap_or_else(|| self.builtin.clone())
             }
         };
-        if previous.as_ref().is_some_and(|p| p.provider != next.provider || p.api_key != next.api_key) {
-            // A breaker opened by the old provider (say, out of credits) must
-            // not keep the new one from being tried.
-            self.circuit.record_success();
-            app_log!(info, provider = %next.provider, model = %next.model, "Assistant provider changed");
+        if previous.as_ref().is_some_and(|p| p.provider != next.provider || p.model != next.model || p.region != next.region) {
+            app_log!(info, tenant_id = %key, provider = %next.provider, model = %next.model, region = ?next.region, "Assistant provider changed");
         }
-        *slot = Some((next.clone(), std::time::Instant::now()));
+        cache.insert(key.to_string(), (next.clone(), std::time::Instant::now()));
         next
     }
 
-    pub fn circuit_state(&self) -> CircuitState {
-        self.circuit.state()
+    fn circuit(&self, provider: &str) -> Arc<CircuitBreaker> {
+        let mut circuits = self.circuits.lock().unwrap_or_else(|e| e.into_inner());
+        circuits.entry(provider.to_string()).or_insert_with(|| Arc::new(CircuitBreaker::new())).clone()
     }
 
-    /// Whether the current provider accepts its key, without spending a token.
+    /// The circuit of `provider`'s calls.
+    pub fn circuit_state(&self, provider: &str) -> CircuitState {
+        self.circuit(provider).state()
+    }
+
+    /// Whether the platform's provider accepts its key, without spending a token.
     ///
     /// Deliberately outside the circuit breaker: this is how an operator finds
     /// out *why* the circuit opened, so it must not be refused by it, and a
     /// failed check must not count toward tripping it.
     pub async fn check_key(&self) -> Result<(), String> {
-        let s = self.settings().await;
+        let s = self.settings(None).await;
         if s.api_key.is_empty() {
             return Err(format!(
                 "no {} key — set DEEPSEEK_API_KEY or choose a provider in Admin → Messaging assistant",
@@ -167,13 +192,15 @@ impl LlmClient {
         tools: &[Tool],
         mcp: &McpClient,
         api_key: &str,
+        tenant_id: &str,
         usage: &mut TurnUsage,
     ) -> BridgeResult<(String, Vec<ChatMessage>)> {
         let chat_tools: Vec<ChatTool> = tools.iter().map(to_chat_tool).collect();
         // One provider for the whole turn, even if the choice changes midway.
-        let llm = self.settings().await;
+        let llm = self.settings(Some(tenant_id)).await;
         usage.provider = llm.provider.clone();
         usage.model = llm.model.clone();
+        usage.region = llm.region.clone();
 
         let mut messages = normalize_history(history);
         messages.push(ChatMessage::text("user", user_message));
@@ -252,9 +279,9 @@ impl LlmClient {
 
     /// Call the provider with exponential backoff retry and circuit breaker.
     async fn call_api_with_retry(&self, llm: &LlmSettings, req: &ChatRequest) -> BridgeResult<ChatResponse> {
-        // Circuit breaker check
-        if !self.circuit.allow_request() {
-            app_log!(warn, "LLM circuit breaker is OPEN — rejecting request");
+        let circuit = self.circuit(&llm.provider);
+        if !circuit.allow_request() {
+            app_log!(warn, provider = %llm.provider, "LLM circuit breaker is OPEN — rejecting request");
             return Err(BridgeError::CircuitOpen);
         }
 
@@ -263,7 +290,7 @@ impl LlmClient {
         for attempt in 0..MAX_RETRIES {
             match self.call_api(llm, req).await {
                 Ok(resp) => {
-                    self.circuit.record_success();
+                    circuit.record_success();
                     return Ok(resp);
                 }
                 Err(e) => {
@@ -276,7 +303,7 @@ impl LlmClient {
 
                     if !retryable || attempt == MAX_RETRIES - 1 {
                         // Non-retryable or exhausted retries
-                        self.circuit.record_failure();
+                        circuit.record_failure();
                         app_log!(
                             error,
                             attempt = attempt + 1,
@@ -302,14 +329,14 @@ impl LlmClient {
             }
         }
 
-        self.circuit.record_failure();
+        circuit.record_failure();
         Err(last_err)
     }
 
     async fn call_api(&self, llm: &LlmSettings, req: &ChatRequest) -> BridgeResult<ChatResponse> {
         let resp = self
             .http
-            .post(llm.endpoint("/v1/chat/completions"))
+            .post(llm.chat_url())
             .bearer_auth(&llm.api_key)
             .json(req)
             .send()
@@ -537,9 +564,24 @@ mod tests {
         let s = LlmSettings {
             provider: "deepseek".into(),
             base_url: "https://api.deepseek.com/anthropic".into(),
+            chat_path: CHAT_PATH.into(),
             api_key: String::new(),
             model: "deepseek-chat".into(),
+            region: None,
         };
-        assert_eq!(s.endpoint("/v1/chat/completions"), "https://api.deepseek.com/v1/chat/completions");
+        assert_eq!(s.chat_url(), "https://api.deepseek.com/v1/chat/completions");
+    }
+
+    #[test]
+    fn a_provider_with_its_own_chat_path_is_called_there() {
+        let s = LlmSettings {
+            provider: "google".into(),
+            base_url: "https://generativelanguage.googleapis.com".into(),
+            chat_path: "/v1beta/openai/chat/completions".into(),
+            api_key: String::new(),
+            model: "gemini".into(),
+            region: Some("usa".into()),
+        };
+        assert_eq!(s.chat_url(), "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions");
     }
 }

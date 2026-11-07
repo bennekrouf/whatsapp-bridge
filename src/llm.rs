@@ -14,6 +14,18 @@ const CHAT_PATH: &str = "/v1/chat/completions";
 /// this, with no restart.
 const SETTINGS_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 const MAX_TOOL_ROUNDS: usize = 10;
+
+/// The most of one tool result the model reads in the turn that called it,
+/// in characters (about 7k tokens of JSON). An API can answer with hundreds of
+/// kilobytes (Azure DevOps' work item types, a long list), and every round of
+/// the turn sends it again: unbounded, one such answer made each call cost
+/// over 100k tokens.
+const MAX_TOOL_RESULT_CHARS: usize = 24_000;
+
+/// What is kept of a tool result once its turn is over. The answer the model
+/// wrote from it is in the history; the raw data, sent again with every later
+/// message for up to 40 messages, would cost far more than it is worth.
+const MAX_SAVED_TOOL_RESULT_CHARS: usize = 2_000;
 const MAX_RETRIES: u32 = 3;
 // Backoff: 1s, 2s, 4s
 const BACKOFF_BASE_MS: u64 = 1000;
@@ -240,6 +252,7 @@ impl LlmClient {
                 let text = reply.content.as_str().unwrap_or_default().to_string();
                 messages.push(ChatMessage::text("assistant", text.clone()));
                 strip_reasoning(&mut messages);
+                shorten_tool_results(&mut messages);
                 return Ok((text, messages));
             };
 
@@ -264,6 +277,11 @@ impl LlmClient {
                 } else {
                     outcome.text
                 };
+                let content = clip(
+                    &content,
+                    MAX_TOOL_RESULT_CHARS,
+                    "Ask the tool for fewer items or a narrower query if more is needed.",
+                );
                 ChatMessage {
                     tool_call_id: Some(call.id.clone()),
                     name: Some(call.function.name.clone()),
@@ -381,6 +399,29 @@ fn strip_reasoning(messages: &mut [ChatMessage]) {
     }
 }
 
+/// `text` cut to its first `max` characters, with a note saying so and what
+/// to do, so the model knows the data is incomplete.
+fn clip(text: &str, max: usize, advice: &str) -> String {
+    let total = text.chars().count();
+    if total <= max {
+        return text.to_string();
+    }
+    let head: String = text.chars().take(max).collect();
+    format!("{head}\n\n[Cut: this result has {total} characters; only the first {max} are shown. {advice}]")
+}
+
+/// Tool results from turns that are over, cut to what is worth keeping.
+fn shorten_tool_results(messages: &mut [ChatMessage]) {
+    for m in messages.iter_mut().filter(|m| m.role == "tool") {
+        if let Some(text) = m.content.as_str() {
+            if text.chars().count() > MAX_SAVED_TOOL_RESULT_CHARS {
+                let short = clip(text, MAX_SAVED_TOOL_RESULT_CHARS, "Call the tool again for the full data.");
+                m.content = serde_json::Value::String(short);
+            }
+        }
+    }
+}
+
 /// Make a saved history safe to send.
 ///
 /// - A history saved while the bridge spoke Anthropic's API has arrays of
@@ -392,6 +433,8 @@ fn strip_reasoning(messages: &mut [ChatMessage]) {
 ///   are dropped; providers reject them.
 /// - Consecutive plain-text messages of the same role, which the above can
 ///   leave behind, are merged.
+/// - Tool results from earlier turns are cut short (shorten_tool_results),
+///   including those saved before that rule.
 pub fn normalize_history(history: Vec<ChatMessage>) -> Vec<ChatMessage> {
     let mut out: Vec<ChatMessage> = Vec::with_capacity(history.len());
     let mut open_calls: Vec<String> = Vec::new();
@@ -454,12 +497,37 @@ pub fn normalize_history(history: Vec<ChatMessage>) -> Vec<ChatMessage> {
             out.pop();
         }
     }
+    shorten_tool_results(&mut out);
     out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_long_result_is_cut_with_a_note_and_a_short_one_is_not() {
+        assert_eq!(clip("short", 10, "x"), "short");
+        let long = "é".repeat(30);
+        let cut = clip(&long, 10, "Ask for less.");
+        assert!(cut.starts_with(&"é".repeat(10)), "cut on characters, not bytes");
+        assert!(cut.contains("has 30 characters; only the first 10 are shown. Ask for less."), "{cut}");
+    }
+
+    #[test]
+    fn earlier_turns_keep_only_the_head_of_their_tool_results() {
+        let big = "x".repeat(MAX_SAVED_TOOL_RESULT_CHARS * 50);
+        let h = normalize_history(vec![
+            ChatMessage::text("user", "list types"),
+            ChatMessage { tool_calls: Some(vec![call("a")]), ..ChatMessage::text("assistant", "") },
+            ChatMessage { tool_call_id: Some("a".into()), ..ChatMessage::text("tool", big) },
+            ChatMessage::text("assistant", "There are 12 types."),
+        ]);
+        let tool = h.iter().find(|m| m.role == "tool").expect("kept");
+        let len = tool.content.as_str().unwrap().chars().count();
+        assert!(len < MAX_SAVED_TOOL_RESULT_CHARS + 200, "{len}");
+        assert_eq!(h.last().unwrap().content.as_str(), Some("There are 12 types."));
+    }
     use crate::models::{FunctionCall, ToolCall};
 
     fn call(id: &str) -> ToolCall {

@@ -110,7 +110,7 @@ pub async fn incoming(
     {
         Ok(r) => r,
         Err(e) => {
-            app_log!(error, error = %e, "Failed to handle Telegram message");
+            app_log!(error, error = %e, tenant = %channel.tenant_id, "Failed to handle Telegram message: {}", e.kind());
             state
                 .store
                 .log_failed_message(CHANNEL, &channel.tenant_id, &external_id, &text, e.kind(), &e.to_string())

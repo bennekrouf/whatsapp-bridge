@@ -1,4 +1,5 @@
 mod circuit_breaker;
+mod error_mail;
 mod config;
 mod llm;
 pub mod error;
@@ -19,7 +20,7 @@ mod whatsapp_api;
 
 use actix_web::{web, App, HttpResponse, HttpServer};
 use config::Config;
-use graflog::{app_log, init_logging, LogOption};
+use graflog::{app_log, LogOption};
 use llm::LlmClient;
 use rate_limit::RateLimiter;
 use std::sync::Arc;
@@ -52,7 +53,9 @@ async fn main() -> std::io::Result<()> {
     let log_path = std::env::var("LOG_PATH_API0")
         .unwrap_or_else(|_| "/tmp/whatsapp-bridge.log".to_string());
 
-    init_logging!(&log_path, "api0", "whatsapp-bridge", &[LogOption::Debug]);
+    // Like the gateway and the store: every error is also emailed to
+    // ALERT_EMAIL, once the store is known (error_mail::start below).
+    error_mail::init_logging(&log_path, &[LogOption::Debug]);
 
     // Load config
     let config_path = std::env::var("CONFIG_PATH")
@@ -90,6 +93,7 @@ async fn main() -> std::io::Result<()> {
     app_log!(info, "WhatsApp bridge starting on {}:{}", config.server.host, config.server.port);
     app_log!(info, "Config: {}", config_path);
     app_log!(info, "Store: {}", config.store.address);
+    error_mail::start("bridge", &config.store.address);
     // Logged because this is the value most likely to be wrong on a deployed
     // host. The gateway listens on 5009 (PM2's API0__SERVER__PORT=50054 has no
     // effect on it). Pointed at the wrong port, linking still succeeds and every

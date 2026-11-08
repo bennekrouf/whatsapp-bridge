@@ -231,7 +231,7 @@ async fn process_payload(
                 if let Err(e) =
                     handle_message(&state, &tenant_id, &phone_number_id, msg).await
                 {
-                    app_log!(error, error = %e, "Failed to handle WA message");
+                    app_log!(error, error = %e, tenant = %tenant_id, "Failed to handle WA message: {}", e.kind());
 
                     state.store.log_failed_message(
                         CHANNEL,

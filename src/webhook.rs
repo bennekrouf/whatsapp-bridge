@@ -177,7 +177,7 @@ pub async fn incoming(
                 tenant_id = %tenant_id,
                 "Webhook POST refused: no App Secret for this tenant and no META_APP_SECRET"
             );
-            return HttpResponse::Unauthorized().body("No App Secret configured for this workspace");
+            return HttpResponse::Unauthorized().body("No App Secret configured for this tenant");
         }
     }
 

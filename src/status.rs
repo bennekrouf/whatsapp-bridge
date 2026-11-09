@@ -42,12 +42,17 @@ pub async fn status(req: HttpRequest, state: web::Data<AppState>) -> HttpRespons
 
     let (llm_key, store, gateway) =
         tokio::join!(state.llm.check_key(), state.store.ping(), state.mcp.check());
+    // Each tenant runs on its own region. A platform provider is only checked
+    // here when the super admin has set one.
     let llm = state.llm.settings().await;
-
-    let circuit = match state.llm.circuit_state(&llm.provider) {
-        CircuitState::Closed => "closed",
-        CircuitState::Open => "open",
-        CircuitState::HalfOpen => "half_open",
+    let (provider, model) = match &llm {
+        Some(s) => (Some(s.provider.as_str()), s.model.as_str()),
+        None => (None, "chosen per tenant"),
+    };
+    let circuit = match provider.map(|p| state.llm.circuit_state(p)) {
+        None | Some(CircuitState::Closed) => "closed",
+        Some(CircuitState::Open) => "open",
+        Some(CircuitState::HalfOpen) => "half_open",
     };
 
     let now = chrono::Utc::now();
@@ -63,8 +68,8 @@ pub async fn status(req: HttpRequest, state: web::Data<AppState>) -> HttpRespons
         // "claude" is this leg's name from before DeepSeek and Mistral; the
         // gateway and the admin panel read it under that name.
         "claude": {
-            "provider": llm.provider,
-            "model": llm.model,
+            "provider": provider,
+            "model": model,
             "key": leg(llm_key),
             "circuit": circuit,
         },

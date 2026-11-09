@@ -5,10 +5,6 @@ use crate::models::{ChatFunction, ChatMessage, ChatRequest, ChatResponse, ChatTo
 use graflog::app_log;
 use std::sync::Arc;
 
-/// The built-in provider, used until the super admin chooses one in api0.
-const DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com";
-/// Where most providers answer chat completions, after their base URL.
-const CHAT_PATH: &str = "/v1/chat/completions";
 /// How long a provider choice is trusted before the store is asked again — so
 /// a change in the admin page, or a workspace's region, takes effect within
 /// this, with no restart.
@@ -61,8 +57,8 @@ impl LlmSettings {
 /// What the store says a workspace's assistant answers with.
 pub enum AssistantConfig {
     Provider(LlmSettings),
-    /// Nothing chosen anywhere: the bridge's built-in provider answers.
-    NotConfigured,
+    /// Nothing chosen: the workspace has picked no region.
+    NotChosen,
     /// The workspace chose this region and it cannot answer. Nothing else may.
     RegionUnavailable(String),
 }
@@ -71,6 +67,8 @@ pub enum AssistantConfig {
 #[derive(Clone)]
 enum Answerer {
     Use(LlmSettings),
+    /// No region chosen. Nothing answers until the workspace picks one.
+    NotChosen,
     Refuse(String),
 }
 
@@ -78,18 +76,17 @@ impl Answerer {
     fn summary(&self) -> String {
         match self {
             Answerer::Use(s) => format!("{}/{}/{:?}", s.provider, s.model, s.region),
+            Answerer::NotChosen => "no region chosen".to_string(),
             Answerer::Refuse(why) => format!("refused: {why}"),
         }
     }
 }
 
-/// The settings cache's key for the platform's provider, which is also what
-/// a workspace without a region of its own answers with.
+/// The settings cache's key for the platform's provider, which only the
+/// bridge's status page looks at: no workspace answers with it.
 const PLATFORM: &str = "";
 
 pub struct LlmClient {
-    /// The bridge's own key and model, from its configuration.
-    builtin: LlmSettings,
     /// What the store says each workspace (and the platform, under
     /// [`PLATFORM`]) answers with, and when it was read.
     chosen: tokio::sync::RwLock<std::collections::HashMap<String, (Answerer, std::time::Instant)>>,
@@ -103,18 +100,8 @@ pub struct LlmClient {
 }
 
 impl LlmClient {
-    /// `api_key` is the built-in DeepSeek key; empty when the deployment relies
-    /// on the provider chosen in the admin page.
-    pub fn new(api_key: String, model: String, max_tokens: u32, store: crate::store_client::StoreClient) -> Self {
+    pub fn new(max_tokens: u32, store: crate::store_client::StoreClient) -> Self {
         Self {
-            builtin: LlmSettings {
-                provider: "deepseek".into(),
-                base_url: DEEPSEEK_BASE_URL.into(),
-                chat_path: CHAT_PATH.into(),
-                api_key,
-                model,
-                region: None,
-            },
             chosen: tokio::sync::RwLock::new(std::collections::HashMap::new()),
             store,
             max_tokens,
@@ -123,20 +110,18 @@ impl LlmClient {
         }
     }
 
-    /// The platform's provider.
-    pub async fn settings(&self) -> LlmSettings {
+    /// The platform's provider, if the super admin set one.
+    pub async fn settings(&self) -> Option<LlmSettings> {
         match self.answerer(None).await {
-            Answerer::Use(s) => s,
-            Answerer::Refuse(_) => self.builtin.clone(),
+            Answerer::Use(s) => Some(s),
+            Answerer::NotChosen | Answerer::Refuse(_) => None,
         }
     }
 
-    /// Who `tenant_id`'s assistant answers with now — its region's provider
-    /// when it chose one, else the super admin's choice, else the built-in
-    /// one; `None` for the platform's. Re-read at most every [`SETTINGS_TTL`].
-    /// A store that cannot be read keeps the last known answer; with none known
-    /// a workspace is refused, since its region may be one the built-in
-    /// provider is outside of.
+    /// Who `tenant_id`'s assistant answers with now: the region it chose, and
+    /// nobody if it chose none; `None` for the platform's. Re-read at most every
+    /// [`SETTINGS_TTL`]. A store that cannot be read keeps the last known
+    /// answer; with none known nobody answers.
     async fn answerer(&self, tenant_id: Option<&str>) -> Answerer {
         let key = tenant_id.unwrap_or(PLATFORM);
         if let Some((s, at)) = self.chosen.read().await.get(key) {
@@ -148,17 +133,16 @@ impl LlmClient {
         let previous = cache.get(key).map(|(s, _)| s.clone());
         let next = match self.store.assistant_config(tenant_id).await {
             Ok(AssistantConfig::Provider(s)) => Answerer::Use(s),
-            Ok(AssistantConfig::NotConfigured) => Answerer::Use(self.builtin.clone()),
+            Ok(AssistantConfig::NotChosen) => Answerer::NotChosen,
             Ok(AssistantConfig::RegionUnavailable(region)) => {
                 Answerer::Refuse(format!("region {region} is not on offer"))
             }
             Err(e) => {
                 app_log!(warn, error = %e, tenant_id = %key, "Could not read the assistant's provider; keeping the last one");
-                match (&previous, tenant_id) {
-                    (Some(p), _) => p.clone(),
+                match &previous {
+                    Some(p) => p.clone(),
                     // Not cached: the next message asks the store again.
-                    (None, Some(_)) => return Answerer::Refuse("the store could not be read".into()),
-                    (None, None) => Answerer::Use(self.builtin.clone()),
+                    None => return Answerer::Refuse("the store could not be read".into()),
                 }
             }
         };
@@ -185,12 +169,11 @@ impl LlmClient {
     /// out *why* the circuit opened, so it must not be refused by it, and a
     /// failed check must not count toward tripping it.
     pub async fn check_key(&self) -> Result<(), String> {
-        let s = self.settings().await;
+        let Some(s) = self.settings().await else {
+            return Ok(());
+        };
         if s.api_key.is_empty() {
-            return Err(format!(
-                "no {} key — set DEEPSEEK_API_KEY or choose a provider in Admin → Messaging assistant",
-                s.provider
-            ));
+            return Err(format!("no {} key", s.provider));
         }
         let url = match s.provider.as_str() {
             // DeepSeek's balance endpoint is free and also says whether there
@@ -254,6 +237,10 @@ impl LlmClient {
         // One provider for the whole turn, even if the choice changes midway.
         let llm = match self.answerer(Some(tenant_id)).await {
             Answerer::Use(s) => s,
+            Answerer::NotChosen => {
+                app_log!(warn, tenant_id = %tenant_id, "Assistant refused: no AI region chosen");
+                return Err(BridgeError::AiRegionNotChosen);
+            }
             Answerer::Refuse(why) => {
                 app_log!(warn, tenant_id = %tenant_id, reason = %why, "Assistant refused: its AI region cannot answer");
                 return Err(BridgeError::AiRegionUnavailable(why));
@@ -697,7 +684,7 @@ mod tests {
     }
 
     fn client(store: crate::store_client::StoreClient) -> LlmClient {
-        LlmClient::new("built-in-key".into(), "deepseek-chat".into(), 100, store)
+        LlmClient::new(100, store)
     }
 
     #[tokio::test]
@@ -707,12 +694,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_workspace_without_a_region_still_gets_the_built_in_provider() {
+    async fn a_workspace_without_a_region_gets_no_provider() {
         let store = store_answering(r#"{"success":true,"configured":false,"region_unavailable":null}"#).await;
-        match client(store).answerer(Some("t1")).await {
-            Answerer::Use(s) => assert_eq!(s.provider, "deepseek"),
-            Answerer::Refuse(why) => panic!("refused: {why}"),
-        }
+        assert!(matches!(client(store).answerer(Some("t1")).await, Answerer::NotChosen));
     }
 
     #[tokio::test]
@@ -721,7 +705,7 @@ mod tests {
         let store = crate::store_client::StoreClient::new("http://127.0.0.1:9".into());
         let c = client(store);
         assert!(matches!(c.answerer(Some("t1")).await, Answerer::Refuse(_)));
-        assert!(matches!(c.answerer(None).await, Answerer::Use(_)));
+        assert!(c.settings().await.is_none(), "no provider is made up in its place");
     }
 
     #[test]
@@ -729,7 +713,7 @@ mod tests {
         let s = LlmSettings {
             provider: "deepseek".into(),
             base_url: "https://api.deepseek.com/anthropic".into(),
-            chat_path: CHAT_PATH.into(),
+            chat_path: "/v1/chat/completions".into(),
             api_key: String::new(),
             model: "deepseek-chat".into(),
             region: None,

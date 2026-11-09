@@ -172,9 +172,23 @@ pub struct TurnUsage {
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub total_tokens: i64,
+    /// How many tools the turn called.
+    pub tool_calls: u32,
+    /// The tool behind each failed call, repeated when it failed more than once.
+    /// A failure costs a whole extra round, so this is what a workspace owner
+    /// reads to see where tokens are going. Names only, never arguments.
+    pub failed_tools: Vec<String>,
 }
 
 impl TurnUsage {
+    pub fn record_tool_call(&mut self, tool: &str, failed: bool) {
+        self.tool_calls += 1;
+        if failed {
+            self.failed_tools.push(tool.to_string());
+        }
+    }
+
+
     pub fn add(&mut self, u: &ChatUsage) {
         self.calls += 1;
         self.input_tokens += u.prompt_tokens;

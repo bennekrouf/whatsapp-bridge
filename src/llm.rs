@@ -305,6 +305,7 @@ impl LlmClient {
 
                 app_log!(info, tool = %call.function.name, is_error = outcome.is_error, "Tool executed via gateway");
 
+                let failed = outcome.is_error;
                 // Chat completions have no is_error flag, so a refusal is
                 // labelled in the text — the model then works around it rather
                 // than treating it as an answer.
@@ -318,14 +319,18 @@ impl LlmClient {
                     MAX_TOOL_RESULT_CHARS,
                     "Ask the tool for fewer items or a narrower query if more is needed.",
                 );
-                ChatMessage {
+                let message = ChatMessage {
                     tool_call_id: Some(call.id.clone()),
                     name: Some(call.function.name.clone()),
                     ..ChatMessage::text("tool", content)
-                }
+                };
+                (message, failed)
             }))
             .await;
-            messages.extend(results);
+            for (call, (message, failed)) in calls.iter().zip(results) {
+                usage.record_tool_call(&call.function.name, failed);
+                messages.push(message);
+            }
         }
 
         Err(BridgeError::ToolLoopExhausted { max_rounds: MAX_TOOL_ROUNDS })

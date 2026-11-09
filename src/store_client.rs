@@ -471,6 +471,8 @@ fn usage_log_body(
             "provider": usage.provider,
             "region": usage.region,
             "llm_calls": usage.calls,
+            "tool_calls": usage.tool_calls,
+            "failed_tools": usage.failed_tools,
         },
     })
 }
@@ -490,8 +492,15 @@ mod tests {
             input_tokens: 900,
             output_tokens: 100,
             total_tokens: 1000,
+            ..Default::default()
         };
+        let mut usage = usage;
+        usage.record_tool_call("update-item", true);
+        usage.record_tool_call("update-item", true);
+        usage.record_tool_call("get-item", false);
         let v = usage_log_body("teams", "t-1", &id, &usage, 1234, false);
+        assert_eq!(v["metadata"]["tool_calls"], 3);
+        assert_eq!(v["metadata"]["failed_tools"], serde_json::json!(["update-item", "update-item"]));
         assert_eq!(v["key_id"], "key-1");
         assert_eq!(v["tenant_id"], "t-1");
         assert_eq!(v["usage"]["total_tokens"], 1000);

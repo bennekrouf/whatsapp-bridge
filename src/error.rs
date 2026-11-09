@@ -71,6 +71,8 @@ pub enum BridgeError {
     // ── AI region ────────────────────────────────
     #[error("The workspace's AI region cannot answer: {0}")]
     AiRegionUnavailable(String),
+    #[error("The workspace has not chosen an AI region")]
+    AiRegionNotChosen,
 
     // ── Generic ──────────────────────────────────────────────────────────────
     #[error("{0}")]
@@ -92,6 +94,7 @@ impl BridgeError {
             BridgeError::LlmParse(_) => "ClaudeParse",
             BridgeError::CircuitOpen => "CircuitOpen",
             BridgeError::AiRegionUnavailable(_) => "AiRegionUnavailable",
+            BridgeError::AiRegionNotChosen => "AiRegionNotChosen",
             BridgeError::ToolLoopExhausted { .. } => "ToolLoopExhausted",
             BridgeError::Store { .. } => "Store",
             BridgeError::StoreNetwork(_) => "StoreNetwork",
@@ -118,6 +121,9 @@ impl BridgeError {
             "ClaudeCredits" | "ClaudeAuth" | "Store" | "StoreNetwork" | "ChannelNotFound" | "TeamsAuth"
             | "AiRegionUnavailable" => {
                 "The assistant is unavailable right now. The team running it has been told why. Please try again later."
+            }
+            "AiRegionNotChosen" => {
+                "This assistant is not set up yet: an admin of this workspace needs to choose its AI region."
             }
             // Passing: a retry in a minute will likely work.
             "ClaudeOverloaded" | "ClaudeNetwork" | "CircuitOpen" | "GatewayNetwork" => {

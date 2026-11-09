@@ -10,8 +10,6 @@ store:
 gateway:
   address: "http://127.0.0.1:5009"
 
-# The built-in AI provider (DeepSeek, key in DEEPSEEK_API_KEY). The provider
-# chosen in Admin → Messaging assistant (DeepSeek or Mistral) overrides it.
+# The provider and model come from the AI region each tenant chooses.
 llm:
-  model: "deepseek-chat"
   max_tokens: 1024

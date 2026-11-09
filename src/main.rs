@@ -66,13 +66,6 @@ async fn main() -> std::io::Result<()> {
         std::process::exit(1);
     });
 
-    // The built-in provider's key. Optional: the provider and key chosen in
-    // Admin → Messaging assistant take over whenever one is set.
-    let deepseek_api_key = std::env::var("DEEPSEEK_API_KEY").unwrap_or_default();
-    if deepseek_api_key.trim().is_empty() {
-        app_log!(warn, "DEEPSEEK_API_KEY not set — the assistant answers only once a provider is chosen in Admin → Messaging assistant");
-    }
-
     let meta_app_secret = std::env::var("META_APP_SECRET").ok().filter(|v| !v.is_empty());
     if meta_app_secret.is_none() {
         app_log!(warn, "META_APP_SECRET not set — WhatsApp tenants without their own App Secret have their messages refused");
@@ -100,7 +93,6 @@ async fn main() -> std::io::Result<()> {
     // tool call fails — so it has to be visible at startup rather than inferred
     // from a failure later.
     app_log!(info, "Gateway: {}", config.gateway.address);
-    app_log!(info, "Built-in model: deepseek / {}", config.llm.model);
 
     let rate_limiter = RateLimiter::new();
     app_log!(info, "Rate limiter initialised");
@@ -113,8 +105,6 @@ async fn main() -> std::io::Result<()> {
         teams: TeamsClient::new(),
         teams_auth: TeamsAuth::new(),
         llm: LlmClient::new(
-            deepseek_api_key.trim().to_string(),
-            config.llm.model.clone(),
             config.llm.max_tokens,
             StoreClient::new(config.store.address.clone()),
         ),

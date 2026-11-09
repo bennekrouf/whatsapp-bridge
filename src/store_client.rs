@@ -55,7 +55,7 @@ impl StoreClient {
     }
 
     /// The AI provider, model and key the assistant answers with: for
-    /// `tenant_id`, its region's when the workspace chose one, else the super
+    /// `tenant_id`, the region the workspace chose; without one, the super
     /// admin's choice.
     pub async fn assistant_config(&self, tenant_id: Option<&str>) -> Result<crate::llm::AssistantConfig, String> {
         let mut url = format!("{}/api/internal/assistant-config", self.base_url);
@@ -78,7 +78,7 @@ impl StoreClient {
             return Ok(crate::llm::AssistantConfig::RegionUnavailable(region.to_string()));
         }
         if !body["configured"].as_bool().unwrap_or(false) {
-            return Ok(crate::llm::AssistantConfig::NotConfigured);
+            return Ok(crate::llm::AssistantConfig::NotChosen);
         }
         let field = |k: &str| body[k].as_str().map(str::to_string).ok_or_else(|| format!("missing {}", k));
         Ok(crate::llm::AssistantConfig::Provider(crate::llm::LlmSettings {

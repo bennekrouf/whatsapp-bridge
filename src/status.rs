@@ -42,7 +42,7 @@ pub async fn status(req: HttpRequest, state: web::Data<AppState>) -> HttpRespons
 
     let (llm_key, store, gateway) =
         tokio::join!(state.llm.check_key(), state.store.ping(), state.mcp.check());
-    let llm = state.llm.settings(None).await;
+    let llm = state.llm.settings().await;
 
     let circuit = match state.llm.circuit_state(&llm.provider) {
         CircuitState::Closed => "closed",

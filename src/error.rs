@@ -68,6 +68,10 @@ pub enum BridgeError {
     #[error("LLM circuit breaker is open — service temporarily unavailable")]
     CircuitOpen,
 
+    // ── AI region ────────────────────────────────
+    #[error("The workspace's AI region cannot answer: {0}")]
+    AiRegionUnavailable(String),
+
     // ── Generic ──────────────────────────────────────────────────────────────
     #[error("{0}")]
     Other(String),
@@ -87,6 +91,7 @@ impl BridgeError {
             BridgeError::LlmNetwork(_) => "ClaudeNetwork",
             BridgeError::LlmParse(_) => "ClaudeParse",
             BridgeError::CircuitOpen => "CircuitOpen",
+            BridgeError::AiRegionUnavailable(_) => "AiRegionUnavailable",
             BridgeError::ToolLoopExhausted { .. } => "ToolLoopExhausted",
             BridgeError::Store { .. } => "Store",
             BridgeError::StoreNetwork(_) => "StoreNetwork",
@@ -110,7 +115,8 @@ impl BridgeError {
     pub fn reply(&self) -> &'static str {
         match self.kind() {
             // Only the workspace's operator can fix these.
-            "ClaudeCredits" | "ClaudeAuth" | "Store" | "StoreNetwork" | "ChannelNotFound" | "TeamsAuth" => {
+            "ClaudeCredits" | "ClaudeAuth" | "Store" | "StoreNetwork" | "ChannelNotFound" | "TeamsAuth"
+            | "AiRegionUnavailable" => {
                 "The assistant is unavailable right now. The team running it has been told why. Please try again later."
             }
             // Passing: a retry in a minute will likely work.

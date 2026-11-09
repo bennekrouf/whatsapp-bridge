@@ -58,6 +58,31 @@ impl LlmSettings {
     }
 }
 
+/// What the store says a workspace's assistant answers with.
+pub enum AssistantConfig {
+    Provider(LlmSettings),
+    /// Nothing chosen anywhere: the bridge's built-in provider answers.
+    NotConfigured,
+    /// The workspace chose this region and it cannot answer. Nothing else may.
+    RegionUnavailable(String),
+}
+
+/// Who answers a workspace now, or why nobody may.
+#[derive(Clone)]
+enum Answerer {
+    Use(LlmSettings),
+    Refuse(String),
+}
+
+impl Answerer {
+    fn summary(&self) -> String {
+        match self {
+            Answerer::Use(s) => format!("{}/{}/{:?}", s.provider, s.model, s.region),
+            Answerer::Refuse(why) => format!("refused: {why}"),
+        }
+    }
+}
+
 /// The settings cache's key for the platform's provider, which is also what
 /// a workspace without a region of its own answers with.
 const PLATFORM: &str = "";
@@ -67,7 +92,7 @@ pub struct LlmClient {
     builtin: LlmSettings,
     /// What the store says each workspace (and the platform, under
     /// [`PLATFORM`]) answers with, and when it was read.
-    chosen: tokio::sync::RwLock<std::collections::HashMap<String, (LlmSettings, std::time::Instant)>>,
+    chosen: tokio::sync::RwLock<std::collections::HashMap<String, (Answerer, std::time::Instant)>>,
     store: crate::store_client::StoreClient,
     max_tokens: u32,
     http: reqwest::Client,
@@ -98,11 +123,21 @@ impl LlmClient {
         }
     }
 
-    /// The provider `tenant_id`'s assistant answers with now — its region's
+    /// The platform's provider.
+    pub async fn settings(&self) -> LlmSettings {
+        match self.answerer(None).await {
+            Answerer::Use(s) => s,
+            Answerer::Refuse(_) => self.builtin.clone(),
+        }
+    }
+
+    /// Who `tenant_id`'s assistant answers with now — its region's provider
     /// when it chose one, else the super admin's choice, else the built-in
-    /// one; `None` for the platform's. Re-read at most every [`SETTINGS_TTL`];
-    /// a store that cannot be read keeps the last known one.
-    pub async fn settings(&self, tenant_id: Option<&str>) -> LlmSettings {
+    /// one; `None` for the platform's. Re-read at most every [`SETTINGS_TTL`].
+    /// A store that cannot be read keeps the last known answer; with none known
+    /// a workspace is refused, since its region may be one the built-in
+    /// provider is outside of.
+    async fn answerer(&self, tenant_id: Option<&str>) -> Answerer {
         let key = tenant_id.unwrap_or(PLATFORM);
         if let Some((s, at)) = self.chosen.read().await.get(key) {
             if at.elapsed() < SETTINGS_TTL {
@@ -112,15 +147,23 @@ impl LlmClient {
         let mut cache = self.chosen.write().await;
         let previous = cache.get(key).map(|(s, _)| s.clone());
         let next = match self.store.assistant_config(tenant_id).await {
-            Ok(Some(s)) => s,
-            Ok(None) => self.builtin.clone(),
+            Ok(AssistantConfig::Provider(s)) => Answerer::Use(s),
+            Ok(AssistantConfig::NotConfigured) => Answerer::Use(self.builtin.clone()),
+            Ok(AssistantConfig::RegionUnavailable(region)) => {
+                Answerer::Refuse(format!("region {region} is not on offer"))
+            }
             Err(e) => {
                 app_log!(warn, error = %e, tenant_id = %key, "Could not read the assistant's provider; keeping the last one");
-                previous.clone().unwrap_or_else(|| self.builtin.clone())
+                match (&previous, tenant_id) {
+                    (Some(p), _) => p.clone(),
+                    // Not cached: the next message asks the store again.
+                    (None, Some(_)) => return Answerer::Refuse("the store could not be read".into()),
+                    (None, None) => Answerer::Use(self.builtin.clone()),
+                }
             }
         };
-        if previous.as_ref().is_some_and(|p| p.provider != next.provider || p.model != next.model || p.region != next.region) {
-            app_log!(info, tenant_id = %key, provider = %next.provider, model = %next.model, region = ?next.region, "Assistant provider changed");
+        if previous.as_ref().is_some_and(|p| p.summary() != next.summary()) {
+            app_log!(info, tenant_id = %key, now = %next.summary(), "Assistant provider changed");
         }
         cache.insert(key.to_string(), (next.clone(), std::time::Instant::now()));
         next
@@ -142,7 +185,7 @@ impl LlmClient {
     /// out *why* the circuit opened, so it must not be refused by it, and a
     /// failed check must not count toward tripping it.
     pub async fn check_key(&self) -> Result<(), String> {
-        let s = self.settings(None).await;
+        let s = self.settings().await;
         if s.api_key.is_empty() {
             return Err(format!(
                 "no {} key — set DEEPSEEK_API_KEY or choose a provider in Admin → Messaging assistant",
@@ -209,7 +252,13 @@ impl LlmClient {
     ) -> BridgeResult<(String, Vec<ChatMessage>)> {
         let chat_tools: Vec<ChatTool> = tools.iter().map(to_chat_tool).collect();
         // One provider for the whole turn, even if the choice changes midway.
-        let llm = self.settings(Some(tenant_id)).await;
+        let llm = match self.answerer(Some(tenant_id)).await {
+            Answerer::Use(s) => s,
+            Answerer::Refuse(why) => {
+                app_log!(warn, tenant_id = %tenant_id, reason = %why, "Assistant refused: its AI region cannot answer");
+                return Err(BridgeError::AiRegionUnavailable(why));
+            }
+        };
         usage.provider = llm.provider.clone();
         usage.model = llm.model.clone();
         usage.region = llm.region.clone();
@@ -625,6 +674,54 @@ mod tests {
         turn.add(with.usage.as_ref().unwrap());
         turn.add(&crate::models::ChatUsage { prompt_tokens: 200, completion_tokens: 10, total_tokens: 210 });
         assert_eq!((turn.calls, turn.input_tokens, turn.output_tokens, turn.total_tokens), (2, 320, 40, 360));
+    }
+
+    /// A store that answers every request with `body`.
+    async fn store_answering(body: &'static str) -> crate::store_client::StoreClient {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 2048];
+                let _ = socket.read(&mut buf).await;
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(reply.as_bytes()).await;
+            }
+        });
+        crate::store_client::StoreClient::new(base)
+    }
+
+    fn client(store: crate::store_client::StoreClient) -> LlmClient {
+        LlmClient::new("built-in-key".into(), "deepseek-chat".into(), 100, store)
+    }
+
+    #[tokio::test]
+    async fn a_region_that_cannot_answer_is_never_replaced() {
+        let store = store_answering(r#"{"success":true,"configured":false,"region_unavailable":"europe"}"#).await;
+        assert!(matches!(client(store).answerer(Some("t1")).await, Answerer::Refuse(_)));
+    }
+
+    #[tokio::test]
+    async fn a_workspace_without_a_region_still_gets_the_built_in_provider() {
+        let store = store_answering(r#"{"success":true,"configured":false,"region_unavailable":null}"#).await;
+        match client(store).answerer(Some("t1")).await {
+            Answerer::Use(s) => assert_eq!(s.provider, "deepseek"),
+            Answerer::Refuse(why) => panic!("refused: {why}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_store_refuses_a_workspace_it_knows_nothing_about() {
+        // Nothing listens on this port.
+        let store = crate::store_client::StoreClient::new("http://127.0.0.1:9".into());
+        let c = client(store);
+        assert!(matches!(c.answerer(Some("t1")).await, Answerer::Refuse(_)));
+        assert!(matches!(c.answerer(None).await, Answerer::Use(_)));
     }
 
     #[test]

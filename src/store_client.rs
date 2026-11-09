@@ -56,9 +56,8 @@ impl StoreClient {
 
     /// The AI provider, model and key the assistant answers with: for
     /// `tenant_id`, its region's when the workspace chose one, else the super
-    /// admin's choice. `Ok(None)` when neither is configured — the bridge then
-    /// uses its own built-in DeepSeek key.
-    pub async fn assistant_config(&self, tenant_id: Option<&str>) -> Result<Option<crate::llm::LlmSettings>, String> {
+    /// admin's choice.
+    pub async fn assistant_config(&self, tenant_id: Option<&str>) -> Result<crate::llm::AssistantConfig, String> {
         let mut url = format!("{}/api/internal/assistant-config", self.base_url);
         if let Some(t) = tenant_id {
             url.push_str(&format!("?tenant_id={}", urlencoding::encode(t)));
@@ -75,11 +74,14 @@ impl StoreClient {
             return Err(format!("the store answered {}", resp.status().as_u16()));
         }
         let body: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+        if let Some(region) = body["region_unavailable"].as_str() {
+            return Ok(crate::llm::AssistantConfig::RegionUnavailable(region.to_string()));
+        }
         if !body["configured"].as_bool().unwrap_or(false) {
-            return Ok(None);
+            return Ok(crate::llm::AssistantConfig::NotConfigured);
         }
         let field = |k: &str| body[k].as_str().map(str::to_string).ok_or_else(|| format!("missing {}", k));
-        Ok(Some(crate::llm::LlmSettings {
+        Ok(crate::llm::AssistantConfig::Provider(crate::llm::LlmSettings {
             provider: field("provider")?,
             base_url: field("base_url")?,
             // A store from before regions sends none: every provider it could
